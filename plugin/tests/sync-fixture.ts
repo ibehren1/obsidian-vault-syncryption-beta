@@ -1,0 +1,92 @@
+/** Devices (one key each) of one user syncing one vault against the real backend. */
+import { MemoryStore } from "../src/store/state";
+import { VaultCipher } from "../src/sync/cipher";
+import { SyncEngine, type SyncProgress } from "../src/sync/engine";
+import { pathFilter } from "../src/sync/filter";
+import { MemoryFs } from "../src/sync/fs";
+import { connect, type VaultSession } from "../src/sync/session";
+import { client, newSeed, SHARED_SECRET, uniqueName } from "./harness";
+
+export interface Device {
+	name: string;
+	session: VaultSession;
+	fs: MemoryFs;
+	store: MemoryStore;
+	engine: SyncEngine;
+	warnings: string[];
+	progress: SyncProgress[];
+}
+
+export function engineFor(
+	session: VaultSession,
+	fs: MemoryFs,
+	name: string,
+	warnings: string[],
+	progress: SyncProgress[] = [],
+): SyncEngine {
+	return new SyncEngine({
+		api: session.api,
+		vaultId: session.vault.id,
+		cipher: new VaultCipher(() => session.keyring),
+		fs,
+		store: session.store,
+		deviceId: session.deviceId,
+		deviceName: name,
+		include: pathFilter({ configDir: ".obsidian" }),
+		configDir: ".obsidian",
+		keyring: { version: () => session.keyring.version, refresh: () => session.refreshKeyring() },
+		onWarning: (m) => warnings.push(m),
+		onProgress: (p) => progress.push(p),
+	});
+}
+
+export async function device(username: string, vaultName: string, name: string, seed = newSeed()): Promise<Device> {
+	const store = new MemoryStore();
+	const session = await connect({
+		api: client(username, vaultName, seed, name),
+		deviceName: name,
+		seed,
+		openStore: async () => store,
+		callbacks: {
+			// Asked only by the key that creates the vault.
+			askSharedSecret: async () => SHARED_SECRET,
+			showPairing: () => {},
+		},
+		pollMs: 20,
+	});
+	const fs = new MemoryFs();
+	const warnings: string[] = [];
+	const progress: SyncProgress[] = [];
+	return { name, session, fs, store, engine: engineFor(session, fs, name, warnings, progress), warnings, progress };
+}
+
+/** Connects a second device and approves it from `first` once it waits. */
+export async function pairedDevice(
+	first: Device,
+	username: string,
+	vaultName: string,
+	name: string,
+	seed = newSeed(),
+): Promise<Device> {
+	const second = device(username, vaultName, name, seed);
+	let failed: unknown = null;
+	second.catch((e: unknown) => (failed = e ?? new Error("device setup failed")));
+	for (;;) {
+		if (failed) throw failed;
+		const pending = await first.session.pendingDevices();
+		if (pending.length) {
+			await first.session.approve(pending[0]!.device);
+			break;
+		}
+		await new Promise((r) => setTimeout(r, 20));
+	}
+	return second;
+}
+
+export async function twoDevices(): Promise<[Device, Device]> {
+	const username = uniqueName("sync");
+	const vaultName = uniqueName("Vault ");
+	const a = await device(username, vaultName, "Laptop");
+	const b = await pairedDevice(a, username, vaultName, "Phone");
+	return [a, b];
+}

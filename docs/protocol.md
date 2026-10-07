@@ -1,0 +1,593 @@
+# Vault Syncryption HTTP Protocol (v1)
+
+Status: draft for M0. The FastAPI app is the implementation of this document, and the
+plugin's TypeScript types are generated from its OpenAPI schema. Crypto details live in
+[crypto.md](crypto.md).
+
+## 1. Conventions
+- **Base URL:** the configured endpoint, e.g. `https://notes.example.com`. All paths
+  below are under `/api/v1`, except `/`, `/health` and `/admin`.
+- **Bodies:** JSON (`application/json`), except blob uploads and downloads, which are
+  `application/octet-stream`.
+- **Binary values in JSON:** `b64u` (base64url, no padding).
+- **IDs:**
+  - `userId`, `vaultId`: UUIDv4 strings.
+  - `deviceId`: `d_` + 22 base62 characters.
+  - `fileId`: `b64u` of the 32-byte HMAC (43 characters).
+  - `blobId`: 64 lowercase hex characters (SHA-256 of the blob bytes).
+- **Times:** RFC 3339 UTC strings (`2026-10-02T12:00:00Z`).
+- **Sequence numbers:** integers. Each vault has its own counter, starting at 1.
+- **Auth:** `Authorization: Bearer <token>` on every endpoint except those marked
+  *public*.
+- **Errors:** a non-2xx status with
+  ```json
+  { "error": "stale_parent", "message": "human readable", "details": { } }
+  ```
+  `error` is a stable machine code. `message` never contains plaintext, keys or tokens.
+
+| Status | `error` codes |
+|---|---|
+| 400 | `bad_request`, `bad_signature_format` |
+| 401 | `unauthenticated`, `token_expired`, `challenge_invalid` |
+| 403 | `forbidden`, `join_required`, `device_pending`, `device_revoked`, `user_disabled`, `vault_disabled` |
+| 404 | `not_found` |
+| 409 | `stale_parent`, `exists`, `keyring_version` |
+| 413 | `too_large` |
+| 422 | `missing_blobs`, `hash_mismatch` |
+| 423 | `locked` |
+| 429 | `rate_limited` (with `Retry-After`) |
+| 503 | `maintenance` (with `Retry-After`, section 14.1) |
+
+`user_disabled` and `vault_disabled` carry `details: {"adminContact": "..."}` when the
+server sets `ADMIN_CONTACT` (free text: an email address, a Slack channel, a phone
+number...), and empty `details` otherwise, so the plugin can say whom to ask.
+
+## 2. Health and the home page
+`GET /health` (*public*) returns `200` once the database is open and the blob store is
+reachable, and `503` with `"status": "unavailable"` otherwise. It is used by the container
+healthcheck, so it stays `200` during maintenance (section 14.1):
+```json
+{
+  "status": "ok",
+  "version": "0.1.3",
+  "protocol": 1,
+  "maintenance": null,
+  "adminContact": "ops@example.com"
+}
+```
+- `status` is `ok`, or `maintenance` while maintenance is on.
+- `maintenance` is `null`, or `{"since": "<RFC 3339>", "message": "..." | null}`.
+- `adminContact` is `ADMIN_CONTACT`, or `null` when it isn't set.
+
+`GET /` (*public*, not in the OpenAPI schema) is a short HTML page (with the admin page's strict headers)
+for people who open the server's URL in a browser: the server version, what the server is,
+how to connect (install the plugin, enter this URL, a username and a vault name, and create
+an encryption key; the first join needs the shared secret, which comes from the
+administrator), the administrator's contact if `ADMIN_CONTACT` is set, and the status (`ok`,
+or maintenance with its start time and message). It never shows the shared secret, and it
+works during maintenance.
+
+## 3. Model: users, devices, vaults
+The server tracks identity and data separately:
+- **User:** a `username`, unique on the server (`[a-z0-9._-]{1,32}`, lowercase).
+- **Vault:** belongs to one user and is identified by `(username, vault name)`. The vault
+  name is unique per user (1 to 64 characters, NFC, trimmed, compared exactly). The server
+  stores the name in clear, because it needs it to look the vault up.
+- **Device:** one encryption key (the public half of an Ed25519 key, sent in OpenSSH
+  `ssh-ed25519 AAAA...` form) in **one vault** of one user. A public key is unique on the
+  server: it belongs to exactly one user and one vault name, and another vault needs
+  another key. Several installations that share one key are a single device to the
+  server. People who share a vault should each use their own key (pairing and approval,
+  section 6), so each can be removed on its own. Each installation also sends a random
+  `clientId` (kept in the app's local storage, so it is never synced), used only to tell
+  installations apart in locks (section 11).
+- **Status:** a device's `status` is its membership of its vault: `pending` until a device
+  of the vault approves it, `active`, or `revoked` once removed. The devices of a vault
+  are its access-control list. The keyring ([crypto.md](crypto.md) section 6) is what
+  actually grants the ability to decrypt, and the two are kept in step by clients.
+- **Creating device:** a new key whose vault doesn't exist yet. It is `active`, has no
+  vault id and only reserves its vault name until it creates the vault (section 7.2).
+
+Every vault endpoint (`/api/v1/vaults/{vaultId}/...`) requires the caller's device to
+belong to that vault (otherwise `403 forbidden`) and to be active (otherwise
+`403 device_pending`).
+
+## 4. Joining the server (shared secret)
+The server is configured with a `SHARED_SECRET` environment variable. It is handed out by
+whoever runs the server, through whatever channel the organisation uses. The secret is
+needed only to **create a vault**: the first time a new key connects for a vault that
+doesn't exist yet (and so possibly a new user). A new key for a vault that already exists
+joins without it, as a pending device that an existing device of the vault approves.
+Logging in later with a known key never needs it.
+
+The plugin asks for it only when the server says it is needed (`join_required`), and
+doesn't store it.
+
+## 5. Auth
+
+### 5.1 Challenge
+`POST /api/v1/auth/challenge` (*public*)
+```json
+{ "username": "alice", "vaultName": "Personal", "publicKey": "ssh-ed25519 AAAA..." }
+```
+Response `200`:
+```json
+{
+  "challengeId": "<b64u 16 bytes>",
+  "message": "syncryption-auth@v1\norigin: https://notes.example.com\nusername: alice\nvault: Personal\nkey: SHA256:...\nnonce: <b64u 32 bytes>\nexpires: 2026-10-02T12:01:00Z\n",
+  "expiresAt": "2026-10-02T12:01:00Z"
+}
+```
+- A challenge is issued for any well-formed Ed25519 key, any valid username and any valid
+  vault name, whether or not they are registered.
+- `vaultName` is required and normalised like `POST /vaults/open` (section 7.1); an
+  invalid name returns `400 bad_request`. The `vault` line carries the normalised name.
+- `origin` is `URL` if it is set, otherwise the scheme and host the request arrived on
+  (honouring `X-Forwarded-Proto`/`X-Forwarded-Host` when `BEHIND_PROXY=TRUE`).
+- The challenge is single-use and expires after 60 s.
+
+The client must check, before signing, that `origin` equals its configured endpoint's
+origin, `username`, `vault` and `key` are its own, and the message has exactly these lines
+in this order. That stops a malicious server from relaying a challenge from another server.
+
+### 5.2 Verify (log in or join)
+`POST /api/v1/auth/verify` (*public*)
+```json
+{
+  "challengeId": "...",
+  "signature": "-----BEGIN SSH SIGNATURE-----\n...",
+  "deviceName": "Isaacs-MacBook",
+  "sharedSecret": "only when creating a vault"
+}
+```
+The username and vault name come from the challenge.
+The signature is an sshsig over `message` (UTF-8) with namespace `syncryption-auth@v1`
+([crypto.md](crypto.md) section 7). The server checks, in order:
+1. The challenge exists, hasn't expired and hasn't been used. It is then marked used,
+   whatever the outcome.
+2. The signature parses, uses namespace `syncryption-auth@v1`, and its public key equals
+   the challenge's key.
+3. The signature verifies. Failures in steps 1 to 3 return `401 challenge_invalid`, with
+   no further detail.
+4. It then looks up the key, then the username and vault name:
+
+| Situation | `sharedSecret` | Result |
+|---|---|---|
+| Key is a device of another user or another vault name | ignored | `401 challenge_invalid` |
+| Key is an active device of this user and vault | ignored | log in, `status: "active"` |
+| Key is a pending device of this user and vault | ignored | log in, `status: "pending"` |
+| Key is a revoked device | ignored | `403 device_revoked` |
+| Key unknown, the vault exists and is enabled | not needed | add the key as a **pending** device of the vault |
+| Key unknown, the vault exists and is disabled | | `403 vault_disabled` |
+| Key unknown, the vault doesn't exist, another new key is creating it | | `409 vault_being_created` |
+| Key unknown, the vault doesn't exist | required | create the user if needed, and the key as an **active creating** device |
+| Secret missing or wrong where it is required | | `403 join_required` |
+
+The first matching row applies. A secret that is sent is always checked, even when it
+isn't needed, so a wrong one returns `join_required`. A creating device has no vault yet:
+it creates it with `POST /vaults` (section 7.2). Until then the vault name is reserved for
+it, and another new key for the same name gets `409 vault_being_created`. A creating
+device that hasn't created its vault within 24 hours is deleted, and the name is free
+again.
+
+The secret is compared in constant time. The `join_required` message is generic: "This
+server needs an access secret to join. Contact your administrator." Its rate limit is
+strict (section 12): only a secret that was sent and is wrong counts as a failure, so a
+client that first tries without one (and then asks the user) isn't penalised. Adding a
+pending device when the vault already has 5 returns `429 rate_limited`.
+
+Anyone who knows a username and one of its vault names can add pending devices to that
+vault without the secret. They get no access until a device of the vault approves them
+(and approval shows the pairing code), and they are bounded by the auth rate limit, the 5
+pending devices per vault and their 24-hour expiry. While 5 such requests are pending,
+other new keys for that vault wait too (`429`) until a device removes them. The answer
+also tells whether such a vault exists.
+
+Response `200`:
+```json
+{ "token": "<b64u 32 bytes>", "expiresAt": "...", "deviceId": "d_...", "vaultId": "<uuid>", "status": "active", "created": true }
+```
+- `created` is true when this request created the user or the device.
+- `vaultId` is the device's vault, or `null` for a creating device.
+- A pending device is approved by an active device of the same vault (section 6). Until
+  then its token only works for `GET /api/v1/devices/self`, `POST /api/v1/vaults/open`
+  and the recovery endpoints (section 7.4), and everything else returns
+  `403 device_pending`. Status is checked on every request, so the same token gains access
+  as soon as it is approved.
+- Tokens are random, stored as `SHA-256(token)`, and expire after 1 hour. The client logs
+  in again on `401 token_expired`.
+
+## 6. Devices
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/v1/devices/self` | the caller's device, pending tokens allowed |
+| `GET` | `/api/v1/vaults/{id}/devices` | the vault's devices |
+| `POST` | `/api/v1/vaults/{id}/devices/{deviceId}/approve` | pending to active |
+| `DELETE` | `/api/v1/vaults/{id}/devices/{deviceId}` | remove (revoke) |
+
+The vault routes need an active device of that vault. `GET .../devices` returns
+`{"devices": [<device object>, ...]}`, oldest first, removed devices included. Approve and
+remove return `200` with the device object; a device that isn't in the vault returns
+`404 not_found`, and approving a removed device returns `400 bad_request`.
+`GET /devices/self` returns the device object plus `vaultId` (`null` for a creating
+device), `vaultName` and `username`.
+
+**Device object:**
+```json
+{
+  "id": "d_...",
+  "name": "MacBook",
+  "publicKey": "ssh-ed25519 AAAA...",
+  "fingerprint": "SHA256:...",
+  "pairingCode": "XXXXX-XXXXX",
+  "status": "pending",
+  "createdAt": "...",
+  "lastSeenAt": "..."
+}
+```
+- `status` is `pending`, `active` or `revoked`. A vault has at most 5 pending devices, and
+  a pending device that isn't approved expires after 24 h.
+- `pairingCode` is computed from the public key ([crypto.md](crypto.md) section 6.5). The
+  approving client recomputes it from `publicKey` and never trusts the server's value.
+- **Approving** is the server half of pairing. The approving client must also add the
+  device to the keyring ([crypto.md](crypto.md) section 6.5). Approval can't grant
+  decryption by itself, since the server never changes a keyring.
+- **Removing** sets `revoked`, deletes the device's sessions and releases its locks. Any
+  active device of the vault can remove any device, itself included (to replace its key),
+  and rejecting a pending device is removing it. Clients then rotate the vault's keyring
+  ([crypto.md](crypto.md) section 8.4). The row stays, so the key can't log in or join
+  again (`403 device_revoked`). The last active device of a vault can't be removed
+  (`409 exists`).
+
+## 7. Vaults and keyring
+
+### 7.1 Opening a vault
+`POST /api/v1/vaults/open` (pending tokens allowed)
+```json
+{ "name": "Personal" }
+```
+| Situation | Result |
+|---|---|
+| `name` is the device's vault | `200 {"vault": <vault object>, "status": "active" \| "pending", "membership": <same as status>}` |
+| The device is creating its vault (no vault id yet) | `404 not_found`, the client then creates it (7.2) |
+| Any other name | `403 forbidden` |
+
+A device only ever opens its own vault, named in its login (section 5). A new key joining
+an existing vault is already pending after verify. The plugin shows its pairing code and
+polls `/vaults/open` (or `/devices/self`) until the status is `active`. `membership` is
+kept for older clients and may be dropped later.
+
+**Vault object:**
+```json
+{ "id": "<uuid>", "name": "Personal", "keyringVersion": 7, "seq": 1042, "createdAt": "..." }
+```
+
+### 7.2 Endpoints
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/v1/vaults` | create: `{"id", "name", "keyring": <keyring object>}`, by a creating device |
+| `GET` | `/api/v1/vaults/{id}/keyring[?version=N]` | latest, or a specific version |
+| `PUT` | `/api/v1/vaults/{id}/keyring` | upload the next version |
+
+- `POST /vaults` returns `201` with the vault object. The caller must be a creating
+  device, and `name` must be the vault name it registered with (otherwise
+  `403 forbidden`). A device that already has a vault, or a vault id or name that is
+  taken, gets `409 exists`. On success the device belongs to the new vault. The `vaultId`
+  is chosen by the client (UUIDv4, also inside the keyring plaintext) so the first keyring
+  can be built before the request.
+
+### 7.3 Keyring object
+GET response, PUT body, and the `keyring` field of `POST /vaults`:
+```json
+{
+  "version": 7,
+  "keyring": "<b64u keyring.age>",
+  "signature": "-----BEGIN SSH SIGNATURE-----...",
+  "signer": "d_...",
+  "recoverySigner": "ssh-ed25519 AAAA...",
+  "byRecovery": false,
+  "createdAt": "..."
+}
+```
+- `POST /vaults` takes `version: 1`. `PUT` must have `version` = current + 1, otherwise
+  `409 keyring_version` with the current version in `details`.
+- The server checks that `signer` is the caller's device (otherwise `403 forbidden`), that
+  it is active, and that the signature verifies with namespace
+  `syncryption-keyring@v1` under the caller's key (otherwise `400 bad_signature_format`).
+  It doesn't (and can't) check the plaintext.
+- `recoverySigner` is a copy of the keyring's recovery signing key
+  ([crypto.md](crypto.md) section 9), or `null` without a recovery key. Clients send it with
+  every upload, and the server uses it to check recovery uploads (7.4). An invalid or
+  non-Ed25519 key gives `400 bad_request`.
+- `byRecovery` (responses only) is true for a version uploaded through `/recover`.
+- `PUT` returns `201` with the stored keyring object.
+- Every version is kept, so clients can verify the chain
+  ([crypto.md](crypto.md) section 6.4). Maximum size is 1 MiB.
+
+### 7.4 Recovery
+A device that holds the vault's recovery key adds itself when no device is left to
+approve it ([crypto.md](crypto.md) section 9). Both endpoints need a device of the vault
+(otherwise `403 forbidden`), and pending tokens are allowed.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/v1/vaults/{id}/recovery` | the current keyring object |
+| `POST` | `/api/v1/vaults/{id}/recover` | upload the next version, signed by the recovery key |
+
+- Both return `404 no_recovery` if the current version has no `recoverySigner`.
+- The `POST` body is a keyring object, as for `PUT .../keyring`, with `signer` the caller's
+  device. The signature must verify under the current version's `recoverySigner`
+  (otherwise `400 bad_signature_format`), and the upload must keep the same
+  `recoverySigner` (otherwise `400 bad_request`). `version` must be current + 1
+  (otherwise `409 keyring_version`).
+- On success the server stores the version with `byRecovery: true`, activates the caller's
+  device if it is pending, and returns `201` with the keyring object.
+
+## 8. Blobs
+Blobs are encrypted chunks ([crypto.md](crypto.md) section 8.2), at most
+4 MiB + 45 bytes.
+
+| Method | Path | Notes |
+|---|---|---|
+| `PUT` | `/api/v1/vaults/{id}/blobs/{blobId}` | raw bytes. `201` if new, `200` if it already exists, both with `{"id", "size"}` |
+| `HEAD` | `/api/v1/vaults/{id}/blobs/{blobId}` | `200` or `404` |
+| `GET` | `/api/v1/vaults/{id}/blobs/{blobId}` | raw bytes |
+| `POST` | `/api/v1/vaults/{id}/blobs/missing` | `{"ids": [...]}` returns `{"missing": [...]}`, at most 1000 ids |
+
+- On `PUT`, the server hashes the body and returns `422 hash_mismatch` if it doesn't
+  equal `blobId`, or `413 too_large` if it exceeds the limit.
+- Blobs are partitioned by user and vault. The store key is
+  `blobs/<userId>/<vaultId>/<blobId[0:2]>/<blobId>`, using ids rather than names so a
+  rename doesn't move data. The layout is the same in `LocalBlobStore` and
+  `S3BlobStore`, which keeps `MIGRATE_TO_S3` a straight copy.
+- Blobs that no revision references are deleted by a periodic garbage collector after a
+  grace period of 24 h, so an upload in progress isn't lost.
+
+## 9. Files and revisions
+
+### 9.1 Revision object
+```json
+{
+  "fileId": "<43 chars>",
+  "rev": 1042,
+  "parentRev": 1017,
+  "deleted": false,
+  "meta": "<b64u encrypted metadata>",
+  "blobs": ["<blobId>", "..."],
+  "size": 1279,
+  "device": "d_...",
+  "createdAt": "..."
+}
+```
+- `rev` is the vault sequence number assigned at commit, so it is unique in the vault and
+  increases with every commit.
+- `size` is the total ciphertext size (`meta` + blobs).
+- `deleted` is in clear so the server can garbage collect. The encrypted metadata repeats
+  it, and the client trusts only the encrypted value.
+
+### 9.2 Endpoints
+| Method | Path | Notes |
+|---|---|---|
+| `PUT` | `/api/v1/vaults/{id}/files/{fileId}` | commit a revision |
+| `GET` | `/api/v1/vaults/{id}/files/{fileId}` | head revision |
+| `GET` | `/api/v1/vaults/{id}/files/{fileId}/revs?before=REV&limit=50` | history, newest first |
+| `GET` | `/api/v1/vaults/{id}/files/{fileId}/revs/{rev}` | one revision (merge base, restore) |
+
+**Commit.** `PUT /api/v1/vaults/{id}/files/{fileId}`
+```json
+{ "parentRev": 1017, "deleted": false, "meta": "...", "blobs": ["..."] }
+```
+In a single SQLite transaction, the server:
+1. Compares `parentRev` with the current head. `null` means "the file must not exist yet".
+   If it doesn't match, it returns `409 stale_parent` with
+   `details: {"head": <revision object>}`, so the client has the remote side for its
+   merge without another round trip.
+2. Checks that every id in `blobs` exists, or returns `422 missing_blobs` with
+   `details: {"missing": [...]}`.
+3. Increments the vault `seq`, inserts the revision with `rev = seq`, moves the head and
+   appends to the change feed.
+
+Response `201`: the revision object.
+
+Other checks: `meta` is at most 64 KiB once decoded (`413 too_large`) and must start with
+the object header (crypto.md 8.1: format `0x01`, then an epoch of at least 1), or the
+server returns `422 malformed`. The server keeps the epoch for retention (9.3). A revision has at
+most 10,000 blobs, and a deletion must have an empty `blobs` list (`400 bad_request`).
+
+`GET .../revs` returns `{"revisions": [<revision object>, ...], "more": bool}`. `limit` is
+at most 100 (default 50). To page back, pass the last `rev` as `before`.
+
+Re-creating a deleted file uses the tombstone's `rev` as `parentRev`. Locks are never
+checked here: they are advisory (section 11).
+
+A revision that retention removed (9.3) returns `404 not_found`, and its blobs do too once
+the garbage collector has run.
+
+### 9.3 Retention
+The server prunes old revisions once an hour, then the blob garbage collector (section 8)
+deletes the blobs no revision references any more. The values are fixed:
+
+| Rule | A revision that isn't its file's head is removed when |
+|---|---|
+| History | it is older than 30 days and at least 10 newer revisions of the file exist |
+| Deleted files | the file's head is a deletion older than 90 days |
+| Old keys | a revision of the same file under a newer epoch exists and is older than 30 days |
+
+- The head of every file is never removed, deletions (tombstones) included, so a
+  re-created file always has its `parentRev`, and a client that is behind still reaches
+  the current state.
+- The "old keys" rule applies even to the last 10 revisions. After a rotation (crypto.md
+  8.4) a file's history starts again from its re-encrypted revision 30 days later, and a
+  revoked device's copy of an old vault key no longer opens anything on the server.
+- The server reads the epoch from the clear header of `meta` (crypto.md 8.1). It never
+  decrypts anything.
+- Retention changes only what the server keeps. Files on devices are never touched.
+- A merge whose base was removed falls back to a merge without a base, which leaves a conflict copy
+  more often (PLAN, Conflicts).
+
+## 10. Change feed and long-poll
+
+### 10.1 Changes
+`GET /api/v1/vaults/{id}/changes?since=N&limit=500`
+```json
+{
+  "changes": [ { "...revision object..." } ],
+  "cursor": 1042,
+  "more": false,
+  "keyringVersion": 4
+}
+```
+- `changes` lists, in ascending `rev` order, every revision with `rev > since`, including
+  `meta`, so a client can apply the feed without one request per file.
+- `cursor` is the highest `rev` returned (or `since` if there are none). The client stores
+  it in IndexedDB after it has applied the batch.
+- `limit` is at most 1000.
+- Revisions removed by retention (9.3) no longer appear. Every file's head always does,
+  so a client that is behind still reaches the current state. A client that meets a
+  revision that was removed meanwhile (`404`) fetches the file's head instead.
+- `keyringVersion` is the vault's current keyring version. A client with an older one
+  fetches the keyring before it applies the batch, so it knows a new epoch first (crypto.md
+  8.4).
+
+### 10.2 Wait (long-poll)
+`GET /api/v1/vaults/{id}/wait?since=N&locksSince=M&keyringSince=K&timeout=25`
+```json
+{ "seq": 1042, "locksSeq": 88, "keyringVersion": 4, "changed": true }
+```
+- Returns as soon as vault `seq > since`, `locksSeq > locksSince` or, if `keyringSince` is
+  given, the keyring version `> keyringSince`, or after `timeout` seconds (at most 25)
+  with `changed: false`.
+- The client then calls `/changes` or `/locks` as needed and loops.
+- On network errors it backs off exponentially, from 1 s up to 60 s. It also backs off
+  when a sync after a wake-up didn't reach `seq`, so a failing sync doesn't spin.
+- Implemented with an in-process `asyncio.Condition` per vault. There is only one
+  container, so no cross-process notification is needed.
+
+## 11. Locks
+Locks are **soft lease locks**: they warn other devices and never block a commit.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/v1/vaults/{id}/locks` | active locks, plus `locksSeq` |
+| `POST` | `/api/v1/vaults/{id}/locks/{fileId}` | acquire or renew |
+| `DELETE` | `/api/v1/vaults/{id}/locks/{fileId}` | release |
+
+**Lock object:**
+```json
+{ "fileId": "...", "device": "d_...", "clientId": "<b64u 16 bytes>", "deviceName": "Pixel", "expiresAt": "..." }
+```
+- The holder is the pair `(device, clientId)`, so installations that share a key still
+  see each other's locks.
+- **Acquire or renew:** body `{"clientId": "...", "ttl": 120}` (seconds, 30 to 300,
+  default 120). Returns `200` with the lock object if it is free, expired or already held
+  by the caller (which renews it). Returns `423 locked` with
+  `details: {"lock": <lock object>}` if another holder has it. The plugin shows the
+  warning and the user may edit anyway.
+- **Heartbeat:** the plugin renews every `ttl / 2` while the file is open in the active
+  editor. It locks only text files it can merge, releases the lock when another file
+  opens or Obsidian goes to the background, and takes it again when Obsidian comes back.
+- **Release:** `DELETE` with `?clientId=...`, returns `204`. It is idempotent, and only the holder can release.
+- Expired locks are treated as absent and swept lazily.
+- Taking a lock (not renewing one), a release, an expiry seen by the sweeper, or a
+  revocation increments the vault's `locksSeq`. Renewals don't, so they wake no one.
+
+## 12. Limits and rate limiting
+| Limit | Value |
+|---|---|
+| Blob size | 4 MiB + 45 bytes |
+| `meta` size | 64 KiB |
+| Keyring size | 1 MiB |
+| Other request bodies | 2 MiB, checked before the body is read (`413 too_large`) |
+| `/auth/*` | 10 requests/min per client address |
+| Wrong shared secrets | 5 per hour per client address, and 50 per hour from all addresses together, then `429`, to stop guessing `SHARED_SECRET`. The server logs a warning when joining pauses. |
+| Pending devices | 5 per vault; they expire after 24 hours |
+| Creating devices | 1 per vault name; deleted after 24 hours if the vault wasn't created |
+| `POST /vaults/{id}/recover` | 10 requests/min per device |
+| Concurrent `/wait` per device | 2. The oldest is answered with `changed: false`. |
+| Revision history | every revision for 30 days, at least the last 10 per file; deleted files 90 days; revisions under an old epoch 30 days after a newer one (9.3) |
+
+- A client address is the connecting IP (the last `X-Forwarded-For` entry with
+  `BEHIND_PROXY=TRUE`). IPv6 addresses count by their /64, since one host usually has a
+  whole /64.
+- There is no per-username login limit: anyone who knows a username could use it to lock
+  that user's devices out, and sshsig signatures can't be guessed.
+- Requests of active devices aren't rate limited otherwise. Only devices approved by the
+  user reach them, and a first sync of a large vault makes many requests in a short time.
+- `429` responses carry `Retry-After` in seconds.
+
+## 13. Versioning
+- The server and the plugin have independent `x.y.z` versions.
+- The API has its own integer **protocol version**, currently `1`. It goes up only on a
+  breaking API change, together with the path prefix (`/api/v1`).
+- Every response carries `X-Syncryption-Version: <server version>` and
+  `X-Syncryption-Protocol: <protocol version>`. `/health` returns both as `version` and
+  `protocol`.
+- The plugin checks only the protocol version. If it differs, it refuses to sync and tells
+  the user which side to update; a missing protocol header (servers before 0.1.1) means
+  "update the server". A response without `X-Syncryption-Version` isn't a Vault
+  Syncryption server.
+
+## 14. Admin
+The admin page is outside `/api/v1` and isn't part of the OpenAPI schema or the plugin's
+API. Every route needs `ADMIN_TOKEN`.
+
+- **Authentication:** `Authorization: Bearer <ADMIN_TOKEN>`, or (pages only) a session
+  cookie from the login form: `POST /admin/login` with the form field `token` sets
+  `syncryption_admin` (HttpOnly, Secure over HTTPS, SameSite=Strict, `Path=/admin`,
+  12 hours). Every form posted with a cookie session carries the session's `csrf` field.
+  `POST /admin/logout` ends the session. The JSON routes take only the Bearer header.
+- **Rate limit:** 5 wrong tokens per IP in 15 minutes. While the limit is full, every
+  attempt from that IP gets `429`, even with the right token.
+- **Pages:** `GET /admin` shows the login form or the dashboard;
+  `POST /admin/{users|vaults}/{id}/{disable|enable|purge}` and
+  `POST /admin/maintenance/{on|off}` (form field `message` for `on`) act and redirect to
+  `/admin?done=<code>`.
+- **JSON:**
+  - `GET /admin/api/status` returns `{"version", "protocol", "maintenance", "adminContact"}`,
+    with the same values as `/health`.
+  - `GET /admin/api/users` returns `{"users": [...]}`. Each user has `id`, `username`,
+    `createdAt`, `lastSeenAt`, `disabled`, `vaults` (`id`, `name`, `size` in stored
+    bytes, `files`, `createdAt`, `lastChangeAt`, `disabled`, and `devices`: `id`, `name`,
+    `fingerprint`, `status`, `createdAt`, `lastSeenAt`) and `creating`
+    (`[{"vaultName", "device"}]`, keys that haven't created their vault yet). Times are
+    RFC 3339 or `null`.
+  - `POST /admin/api/{users|vaults}/{id}/{disable|enable}` returns `204`.
+  - `POST /admin/api/{users|vaults}/{id}/purge` with `{"confirm": "<username or vault
+    name>"}` returns `204`. It returns `409 not_disabled` unless the item is disabled
+    first, and `400 confirm` if the name doesn't match.
+- **Effect on clients:** a disabled user gets `403 user_disabled` on login and on every
+  request; a disabled vault gets `403 vault_disabled` on open and on every vault request.
+  Waiting long-polls return at once. Purging deletes the blobs first, then the rows, so a
+  failed purge can be run again.
+- **Purging removes keys:** purging a vault also deletes all its devices (encryption keys),
+  whatever their status, with their sessions, locks and challenges. The keys are unknown
+  again, so they need the shared secret to create a vault (section 5.2). Purging a user
+  purges each of its vaults, deletes its remaining devices (such as creating ones), then
+  the user.
+
+### 14.1 Maintenance
+The administrator can pause sync for the whole server, for example to move it or restore a
+backup.
+
+- **Switch:** `POST /admin/api/maintenance/on` with an optional body
+  `{"message": "back at 18:00 UTC"}` (one line, at most 500 characters, otherwise
+  `400 bad_request`), and `POST /admin/api/maintenance/off`. Both return `204` and can be
+  repeated: turning it on again replaces the message and keeps the start time. The
+  dashboard has the same switch.
+- **Storage:** a row in the `maintenance` table, so it survives a restart. The server keeps
+  a copy in memory and doesn't read the table per request.
+- **While on,** every request under `/api/v1` returns `503` with `Retry-After: 60` and the
+  usual version headers:
+  ```json
+  {
+    "error": "maintenance",
+    "message": "The server is in maintenance, so sync is paused. It resumes by itself when maintenance ends.",
+    "details": { "adminContact": "ops@example.com", "note": "back at 18:00 UTC", "since": "2026-10-05T12:00:00Z" }
+  }
+  ```
+  `adminContact` and `note` are `null` when unset. `/`, `/health` and `/admin` keep working.
+- **Long-polls:** turning maintenance on wakes every waiting `/wait`, which answers with the
+  same `503` at once.
+- **Clients** are expected to pause sync, show the message and the contact, and retry after
+  `Retry-After`. Nothing changes on the server while it is on, so they resume where they
+  stopped.
