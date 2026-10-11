@@ -5,6 +5,7 @@
  */
 import { concat, fromUtf8, utf8 } from "../crypto/bytes";
 import { openLocal, sealLocal } from "../crypto/local";
+import { MissingContentError } from "../sync/fs";
 
 /** The size and times of a remote-only file, kept next to its sealed content. */
 export interface EntryInfo {
@@ -242,12 +243,18 @@ export class StubAdapter {
 		this.dropResource(path);
 	}
 
-	/** The plaintext of a remote-only file. A file not yet in the store is read from disk. */
+	/**
+	 * The plaintext of a remote-only file. A file not yet in the store is read from disk, but
+	 * an empty one there is a stub whose content is missing, never empty content: reading it
+	 * as content would let a sync commit it over the file.
+	 */
 	private async content(path: string): Promise<Uint8Array> {
 		this.requireKey();
 		const entry = await this.opts.store.get(path);
 		if (entry) return this.open(path, entry);
-		return new Uint8Array(await this.raw.readBinary(path));
+		const plain = new Uint8Array(await this.raw.readBinary(path));
+		if (plain.length === 0) throw new MissingContentError();
+		return plain;
 	}
 
 	/** Stores the content and leaves an empty stub with the file's times, so Obsidian sees a change. */
@@ -266,13 +273,16 @@ export class StubAdapter {
 		return s?.type === "file" ? s.size : null;
 	}
 
-	/** Moves a file that is on disk in plaintext into the store. */
-	async convert(path: string): Promise<boolean> {
+	/**
+	 * Moves a file that is on disk in plaintext into the store. An empty file is taken as
+	 * content only with `empty` (the files of a full device): otherwise it is a stub.
+	 */
+	async convert(path: string, empty = false): Promise<boolean> {
 		return this.serial(path, async () => {
 			const stat = await this.raw.stat(path);
 			if (stat?.type !== "file") return false;
 			const plain = new Uint8Array(await this.raw.readBinary(path));
-			if (plain.length === 0 && this.index.has(path)) return false;
+			if (plain.length === 0 && (!empty || this.index.has(path))) return false;
 			await this.put(path, plain, { mtime: stat.mtime, ctime: stat.ctime });
 			return true;
 		});

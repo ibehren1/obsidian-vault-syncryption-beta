@@ -3,7 +3,7 @@ import { MemoryStore } from "../src/store/state";
 import { VaultCipher } from "../src/sync/cipher";
 import { SyncEngine, type SyncProgress } from "../src/sync/engine";
 import { pathFilter } from "../src/sync/filter";
-import { MemoryFs } from "../src/sync/fs";
+import { MemoryFs, type VaultFs } from "../src/sync/fs";
 import { connect, type VaultSession } from "../src/sync/session";
 import { client, newSeed, SHARED_SECRET, uniqueName } from "./harness";
 
@@ -19,7 +19,7 @@ export interface Device {
 
 export function engineFor(
 	session: VaultSession,
-	fs: MemoryFs,
+	fs: VaultFs,
 	name: string,
 	warnings: string[],
 	progress: SyncProgress[] = [],

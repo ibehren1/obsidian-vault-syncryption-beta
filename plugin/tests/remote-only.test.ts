@@ -2,13 +2,45 @@ import { describe, expect, it } from "vitest";
 
 import { complianceReport, duration, type ComplianceFacts } from "../src/remote/compliance";
 import { RemoteStatFs } from "../src/remote/stat-fs";
-import { MemoryEntryStore, StubAdapter } from "../src/remote/stub-adapter";
-import { MemoryFs } from "../src/sync/fs";
+import { MemoryEntryStore, StubAdapter, type WrappedAdapter } from "../src/remote/stub-adapter";
+import { MemoryFs, type FileStat, type ListedFile, type VaultFs } from "../src/sync/fs";
 import { isLocked } from "../src/api/http";
+import { FakeDisk } from "./fake-disk";
 import { noBackend, uniqueName } from "./harness";
-import { device, pairedDevice } from "./sync-fixture";
+import { device, engineFor, pairedDevice } from "./sync-fixture";
 
 const NOW = 1_790_000_000_000;
+
+/** A remote-only device's files as the engine sees them: through the wrapped adapter. */
+class StubFs implements VaultFs {
+	constructor(
+		private readonly disk: FakeDisk,
+		private readonly adapter: WrappedAdapter,
+	) {}
+	async list(): Promise<ListedFile[]> {
+		return Promise.all([...this.disk.files.keys()].map(async (path) => ({ path, ...(await this.stat(path))! })));
+	}
+	async stat(path: string): Promise<FileStat | null> {
+		const s = await this.adapter.stat(path);
+		return s && { mtime: s.mtime, ctime: s.ctime, size: s.size };
+	}
+	async read(path: string): Promise<Uint8Array> {
+		return new Uint8Array(await this.adapter.readBinary(path));
+	}
+	write(path: string, data: Uint8Array, times: { mtime: number; ctime?: number }): Promise<void> {
+		return this.adapter.writeBinary(path, data.slice().buffer, times);
+	}
+	remove(path: string): Promise<void> {
+		return this.adapter.remove(path);
+	}
+}
+
+function wrap(disk: FakeDisk, store = new MemoryEntryStore()) {
+	const stub = new StubAdapter({ isRemote: (p) => !p.startsWith("."), store, urls: { create: () => "", revoke: () => {} } });
+	const uninstall = stub.install(disk);
+	stub.unlock(new Uint8Array(32).fill(3));
+	return { stub, uninstall };
+}
 
 function facts(over: Partial<ComplianceFacts> = {}): ComplianceFacts {
 	return {
@@ -105,6 +137,52 @@ describe.skipIf(noBackend)("remote-only approval", () => {
 			status: 403,
 			code: "remote_only",
 		});
+	});
+});
+
+describe.skipIf(noBackend)("stubs without their content", () => {
+	it("are downloaded again, never committed as empty notes", async () => {
+		const username = uniqueName("stubs");
+		const vaultName = uniqueName("Vault ");
+		const a = await device(username, vaultName, "Laptop");
+		const b = await pairedDevice(a, username, vaultName, "Phone", undefined, { remoteOnly: true });
+		a.fs.set("note.md", "hello\n");
+		a.fs.set("empty.md", "");
+		await a.engine.sync();
+
+		const disk = new FakeDisk();
+		let { uninstall } = wrap(disk);
+		const warnings: string[] = [];
+		await engineFor(b.session, new StubFs(disk, disk), "Phone", warnings).sync();
+		expect(disk.text("note.md")).toBe("");
+		expect(await disk.read("note.md")).toBe("hello\n");
+
+		// The sealed content is lost (a new, empty store): only the stubs are left.
+		uninstall();
+		({ uninstall } = wrap(disk));
+		const engine = engineFor(b.session, new StubFs(disk, disk), "Phone", warnings);
+		await engine.sync();
+		expect(await disk.read("note.md")).toBe("hello\n");
+		expect(warnings).toEqual(["Downloaded 1 file again: the content was missing on this device."]);
+		await a.engine.sync();
+		expect(a.fs.text("note.md")).toBe("hello\n");
+		expect((await a.engine.history("note.md")).entries).toHaveLength(1);
+	});
+
+	it("aren't committed by a sync still running when the engine closes", async () => {
+		const [a, b] = await (async () => {
+			const username = uniqueName("close");
+			const vaultName = uniqueName("Vault ");
+			const first = await device(username, vaultName, "Laptop");
+			return [first, await pairedDevice(first, username, vaultName, "Phone")] as const;
+		})();
+		a.fs.set("note.md", "one\n");
+		await a.engine.sync();
+		a.fs.set("note.md", "two\n");
+		a.engine.close();
+		await expect(a.engine.sync()).rejects.toThrow("Sync stopped.");
+		await b.engine.sync();
+		expect(b.fs.text("note.md")).toBe("one\n");
 	});
 });
 

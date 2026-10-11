@@ -245,6 +245,14 @@ path beside the Vault API. Instead:
   (`files.sha256`) would let anyone confirm a guess of a file's content, so a remote-only
   device stores them sealed (`s1:`, crypto.md 11). Storing a file fails while locked.
 - Paths are in plaintext on disk anyway (the stubs), so keying by path hides nothing more.
+- **A stub is never content.** An empty file on disk with no entry in the store is a stub
+  whose content is missing (the store was lost, or never filled). Reading it fails
+  (`MissingContentError`) instead of returning empty content. The sync engine then
+  downloads the file's head again and never commits the stub. Only the first conversion,
+  when a full device becomes remote-only, takes empty files as empty notes.
+- **Disconnecting stops a running sync.** Locking, losing the connection to a lock from
+  another device, and unloading the plugin close the engine. A sync that is still running
+  fails at its next write or commit, so it can't commit what it reads after that.
 - An offline edit is sealed when it is written. Nothing decrypted is kept beyond
   Obsidian's own caches and the `blob:` URLs of resources, which are dropped on lock.
 

@@ -152,8 +152,10 @@ export class RemoteOnly {
 		this.api = session.api;
 		this.setFlag({ vaultId });
 		await store.sealAll(key);
+		// Only a full device's empty files are empty notes. Later, an empty file without its
+		// content in the store is a stub: the sync downloads it again.
 		for (const file of this.remoteFiles()) {
-			if (((await stub.diskSize(file.path)) ?? 0) > 0 || !stub.info(file.path)) await stub.convert(file.path);
+			if (((await stub.diskSize(file.path)) ?? 0) > 0 || !stub.info(file.path)) await stub.convert(file.path, !flag);
 		}
 		await this.reindex();
 		return "remote-only";

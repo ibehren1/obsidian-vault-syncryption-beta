@@ -1,86 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { LockedError, MemoryEntryStore, StubAdapter, type WrappedAdapter } from "../src/remote/stub-adapter";
+import { isMissingContent } from "../src/sync/fs";
+import { FakeDisk } from "./fake-disk";
 
-const enc = new TextEncoder();
 const dec = new TextDecoder();
 const KEY = new Uint8Array(32).fill(7);
-
-/** A disk like `DataAdapter` sees it, with only the methods the wrapper replaces. */
-class FakeDisk implements WrappedAdapter {
-	readonly files = new Map<string, { data: Uint8Array; mtime: number; ctime: number }>();
-	readonly folders = new Set<string>();
-
-	put(path: string, text: string, mtime = 1000): void {
-		this.files.set(path, { data: enc.encode(text), mtime, ctime: mtime });
-	}
-	text(path: string): string | undefined {
-		const f = this.files.get(path);
-		return f && dec.decode(f.data);
-	}
-
-	async read(path: string) {
-		return dec.decode(new Uint8Array(await this.readBinary(path)));
-	}
-	async readBinary(path: string) {
-		const f = this.files.get(path);
-		if (!f) throw new Error(`ENOENT ${path}`);
-		return f.data.slice().buffer;
-	}
-	async write(path: string, data: string, options?: { mtime?: number; ctime?: number }) {
-		await this.writeBinary(path, enc.encode(data).buffer, options);
-	}
-	async writeBinary(path: string, data: ArrayBuffer, options?: { mtime?: number; ctime?: number }) {
-		const mtime = options?.mtime ?? 5000;
-		this.files.set(path, { data: new Uint8Array(data.slice(0)), mtime, ctime: options?.ctime ?? mtime });
-	}
-	async append(path: string, data: string) {
-		await this.write(path, (this.text(path) ?? "") + data);
-	}
-	async appendBinary(path: string, data: ArrayBuffer) {
-		await this.append(path, dec.decode(data));
-	}
-	async process(path: string, fn: (data: string) => string) {
-		const out = fn(this.text(path) ?? "");
-		await this.write(path, out);
-		return out;
-	}
-	async stat(path: string) {
-		const f = this.files.get(path);
-		if (f) return { type: "file" as const, mtime: f.mtime, ctime: f.ctime, size: f.data.length };
-		return this.folders.has(path) ? { type: "folder" as const, mtime: 0, ctime: 0, size: 0 } : null;
-	}
-	async copy(from: string, to: string) {
-		this.files.set(to, { ...this.files.get(from)! });
-	}
-	async rename(from: string, to: string) {
-		for (const [p, f] of [...this.files]) {
-			if (p === from || p.startsWith(`${from}/`)) {
-				this.files.delete(p);
-				this.files.set(to + p.slice(from.length), f);
-			}
-		}
-		if (this.folders.delete(from)) this.folders.add(to);
-	}
-	async remove(path: string) {
-		this.files.delete(path);
-	}
-	async rmdir(path: string) {
-		for (const p of [...this.files.keys()]) if (p.startsWith(`${path}/`)) this.files.delete(p);
-		this.folders.delete(path);
-	}
-	async trashSystem(path: string) {
-		await this.rmdir(path);
-		this.files.delete(path);
-		return true;
-	}
-	async trashLocal(path: string) {
-		await this.trashSystem(path);
-	}
-	getResourcePath(path: string) {
-		return `app://disk/${path}`;
-	}
-}
 
 function setup() {
 	const disk = new FakeDisk();
@@ -148,6 +73,19 @@ describe("StubAdapter", () => {
 		expect(await adapter.process("R/a.md", (s) => s.toUpperCase())).toBe("ONE TWO");
 		expect(await adapter.read("R/a.md")).toBe("ONE TWO");
 		expect(disk.text("R/a.md")).toBe("");
+	});
+
+	it("never reads an empty stub without its content as empty content", async () => {
+		const { disk, store, stub, adapter } = setup();
+		disk.put("R/lost.md", "");
+		disk.put("R/new.md", "fresh");
+		await expect(adapter.read("R/lost.md")).rejects.toSatisfy(isMissingContent);
+		expect(await adapter.read("R/new.md")).toBe("fresh");
+		// Only a full device's empty files are converted as empty notes.
+		expect(await stub.convert("R/lost.md")).toBe(false);
+		expect(store.entries.size).toBe(0);
+		expect(await stub.convert("R/lost.md", true)).toBe(true);
+		expect(await adapter.read("R/lost.md")).toBe("");
 	});
 
 	it("fails reads and writes while locked, and serves them again after unlock", async () => {

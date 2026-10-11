@@ -425,6 +425,8 @@ export default class SyncryptionPlugin extends Plugin {
 		this.session = null;
 		this.sessionSlot = null;
 		this.serverDevices = null;
+		// A sync still running mustn't commit what it reads after a lock or an unload.
+		this.engine?.close();
 		this.engine = null;
 		this.firstSync = false;
 		this.hideProgress();
