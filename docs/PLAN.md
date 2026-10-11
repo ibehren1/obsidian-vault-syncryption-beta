@@ -178,7 +178,7 @@ All endpoints except `/`, `/health` and `/admin` sit under `/api/v1`. The full s
 ├── README.md, LICENSE (MIT), SECURITY.md
 ├── manifest.json, versions.json   # copies of plugin/'s, read by Obsidian for updates
 ├── docker-compose.dev.yml    # development (MinIO)
-├── scripts/  build.sh (image), push-public-release.sh (private repo only)
+├── scripts/  build.sh (image), push-public-release.sh, push-beta-release.sh (private repo only)
 ├── docs/ architecture.md, protocol.md, crypto.md, self-hosting.md
 ├── backend/  pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, container-checks.sh,
 │             docker/docker-compose.yml (hosting; all vars inline, no .env),
@@ -234,7 +234,7 @@ All endpoints except `/`, `/health` and `/admin` sit under `/api/v1`. The full s
   - rate limiting
   - mobile QA (shipped as beta in 0.1.0, finished after the release; the beta note is gone since plugin 0.1.12)
 - **M8, release:**
-  - public GitHub repo `ibehren1/obsidian-vault-syncryption`. `scripts/push-public-release.sh` pushes a snapshot of `main` with private files stripped (`scripts/`, `CLAUDE.md`, `STATUS.md`, `.gitea/`, `.claude/`), one commit per push, so the private history stays private.
+  - public GitHub repo `ibehren1/obsidian-vault-syncryption`. `scripts/push-public-release.sh` pushes a snapshot of `main` with private files stripped (`scripts/`, `CLAUDE.md`, `STATUS.md`, `.gitea/`, `.claude/`), one commit per push, so the private history stays private. `scripts/push-beta-release.sh` does the same for the beta repo `ibehren1/obsidian-vault-syncryption-beta`.
   - plugin id `vault-syncryption`; `manifest.json` and `versions.json` are copied to the repo root (Obsidian reads them there), kept in sync by `npm version` and checked in CI.
   - `.github/workflows/release.yml` on the public repo creates the GitHub release (tag = version, `main.js`, `manifest.json`, `styles.css`) when `main` has a version that isn't released yet. BRAT works from these releases until the store listing is approved.
   - submission to the community plugin store
@@ -244,6 +244,11 @@ All endpoints except `/`, `/health` and `/admin` sit under `/api/v1`. The full s
   - maintenance mode: the admin turns it on (with an optional message) and off from the admin page or `POST /admin/api/maintenance/on` (optional body `{"message": "..."}`) and `POST /admin/api/maintenance/off`. It is stored in the database, so it persists across restarts. While on, the sync API answers 503 `maintenance` with `Retry-After`, and the plugin shows "maintenance" (sync paused, resumes by itself, contact the admin) and retries automatically. `/`, `/health` (200 with `"status": "maintenance"`) and `/admin` keep working. Details in protocol.md 2 and 14.
 
 ## Post-v1 Ideas
+- **Remote-only devices (proposed, spike pending; see `docs/remote-only.md`):** a key approved as remote-only keeps note and attachment contents on the device only as ciphertext, served to Obsidian through a wrapped `app.vault.adapter` with zero-byte stubs on disk. The keyring is never stored, so removing the key leaves the device's copy useless.
+  - The policy goes in the signed keyring entry.
+  - Remote-only devices can't manage the vault.
+  - Sessions are short leases. The grace period is set by the server admin: 24 h by default, adjustable per vault.
+  - Paths stay in plaintext on the device (the stubs), and `configDir` stays normal files.
 - **SSH agent unlock (desktop only; would bring back external keys, which 0.1.3 removed):** keep the private key in `ssh-agent` (macOS Keychain, gnome-keyring, KeePassXC, the Windows OpenSSH agent or Pageant) instead of `SecretStorage`.
   - Login already works through an agent, since it is just an sshsig signature.
   - An agent can't do the X25519 operation that the age `ssh-ed25519` stanza needs. Ed25519 signatures are deterministic, though, so the plugin can derive a second X25519 identity from an agent signature over a fixed message under its own namespace (`syncryption-unlock@v1`). The keyring is then also encrypted to that identity, and the standard stanza stays for `age -d -i` recovery.

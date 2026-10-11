@@ -68,7 +68,9 @@ flowchart LR
   be told apart or revoked separately. Sharing through separate keys under the same
   username (each paired into the vault) avoids that.
 - A device whose key leaks can read everything that device could read. Revocation
-  (section 8) protects data written **after** the revocation.
+  (section 8) protects data written **after** the revocation. Proposed remote-only
+  devices ([remote-only.md](remote-only.md)) would also make the device's own local copy
+  unreadable after revocation, but not data copied while the device was still a member.
 - A malicious server can deny service or roll the whole vault back to an older state it
   has seen. Clients detect rollback of the keyring (section 6.4). Detecting rollback of
   individual files is out of scope for v1.

@@ -1,12 +1,22 @@
 import { debounce, Notice, Plugin, requireApiVersion, TAbstractFile, TFile, type EventRef, type Vault } from "obsidian";
 
 import { ApiClient, type Device } from "./api/client";
-import { ApiError, disabledText, isDisabled, isMaintenance, maintenanceText, NetworkError } from "./api/http";
+import {
+	ApiError,
+	disabledText,
+	isDisabled,
+	isMaintenance,
+	isRevoked,
+	maintenanceText,
+	NetworkError,
+	REVOKED_TEXT,
+} from "./api/http";
 import { hasSecretStorage, MIN_APP_VERSION } from "./compat";
 import { generateRecoveryKey } from "./crypto/keyring";
 import { fingerprint, parsePublicKeyText, publicKeyText, writeOpenSshPrivateKey, type OpenSshKey } from "./crypto/openssh";
 import { loadKeyText, saveKeyText, unlockKey } from "./keys";
 import { requestUrlTransport } from "./obsidian/transport";
+import { RemoteOnlySpike } from "./remote/spike";
 import { ObsidianFs } from "./obsidian/fs";
 import {
 	currentKeySlot,
@@ -122,6 +132,8 @@ export default class SyncryptionPlugin extends Plugin {
 			new Notice(`Vault Syncryption needs Obsidian ${MIN_APP_VERSION} or later. Please update Obsidian.`);
 			return;
 		}
+		// SPIKE (docs/remote-only.md section 9): off unless enabled on this device.
+		await new RemoteOnlySpike(this).load();
 		await this.loadSettings();
 		this.addSettingTab(new SyncryptionSettingTab(this.app, this));
 		this.userPaused = this.app.loadLocalStorage(PAUSED) === true;
@@ -1034,6 +1046,10 @@ export default class SyncryptionPlugin extends Plugin {
 		if (isDisabled(e)) {
 			message = disabledText(e);
 			this.stop(); // until the user reconnects
+		} else if (isRevoked(e)) {
+			// Retrying can't help: the key can never log in again.
+			message = REVOKED_TEXT;
+			this.stop();
 		}
 		// Syncs retry on every wake-up and timer tick: show each error once, not on every retry.
 		const repeated = this.lastError === message;

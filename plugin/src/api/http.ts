@@ -37,6 +37,14 @@ export function isDisabled(e: unknown): e is ApiError {
 	return e instanceof ApiError && (e.code === "user_disabled" || e.code === "vault_disabled");
 }
 
+/** This device's key was removed from the vault (protocol.md 6): it can never log in again. */
+export function isRevoked(e: unknown): e is ApiError {
+	return e instanceof ApiError && e.code === "device_revoked";
+}
+
+export const REVOKED_TEXT =
+	"This device's encryption key was removed from the vault. Generate a new key in the settings to pair the device again.";
+
 /**
  * The administrator put the server in maintenance (`503 maintenance`): every request is
  * refused until it ends. A temporary pause, not an error: keep the session and retry.
