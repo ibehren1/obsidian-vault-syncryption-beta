@@ -137,6 +137,8 @@ export class StubAdapter {
 	/** The store's entries without their content, loaded by `load`. */
 	private readonly index = new Map<string, EntryInfo>();
 	private readonly urls: { create(blob: Blob): string; revoke(url: string): void };
+	/** Set by `restoreAll`: the files go back on disk for good. */
+	private restoring = false;
 
 	constructor(private readonly opts: StubAdapterOptions) {
 		this.urls = opts.urls ?? { create: (b) => URL.createObjectURL(b), revoke: (u) => URL.revokeObjectURL(u) };
@@ -279,6 +281,7 @@ export class StubAdapter {
 	 */
 	async convert(path: string, empty = false): Promise<boolean> {
 		return this.serial(path, async () => {
+			if (this.restoring) return false;
 			const stat = await this.raw.stat(path);
 			if (stat?.type !== "file") return false;
 			const plain = new Uint8Array(await this.raw.readBinary(path));
@@ -292,11 +295,32 @@ export class StubAdapter {
 	async restore(path: string): Promise<boolean> {
 		return this.serial(path, async () => {
 			const entry = await this.opts.store.get(path);
-			if (!entry) return false;
+			if (!entry) {
+				this.index.delete(path);
+				return false;
+			}
 			await this.raw.writeBinary(path, buffer(this.open(path, entry)), { mtime: entry.mtime, ctime: entry.ctime });
 			await this.drop(path);
 			return true;
 		});
+	}
+
+	/**
+	 * Writes every file back to disk in plaintext (becoming a full device). From here on
+	 * `convert` does nothing: Obsidian's `modify` events for the restored files would move
+	 * them back into the store, which is then deleted. Returns the paths still in the store.
+	 */
+	async restoreAll(): Promise<string[]> {
+		this.restoring = true;
+		try {
+			for (const path of this.paths()) await this.restore(path);
+		} catch (e) {
+			this.restoring = false;
+			throw e;
+		}
+		const left = this.paths();
+		if (left.length) this.restoring = false;
+		return left;
 	}
 
 	// The wrapped `DataAdapter` methods.

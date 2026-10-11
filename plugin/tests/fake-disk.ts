@@ -7,6 +7,8 @@ const dec = new TextDecoder();
 export class FakeDisk implements WrappedAdapter {
 	readonly files = new Map<string, { data: Uint8Array; mtime: number; ctime: number }>();
 	readonly folders = new Set<string>();
+	/** Called after every write, like Obsidian's `modify` event. */
+	onWrite?: (path: string) => void;
 
 	put(path: string, text: string, mtime = 1000): void {
 		this.files.set(path, { data: enc.encode(text), mtime, ctime: mtime });
@@ -30,6 +32,7 @@ export class FakeDisk implements WrappedAdapter {
 	async writeBinary(path: string, data: ArrayBuffer, options?: { mtime?: number; ctime?: number }) {
 		const mtime = options?.mtime ?? 5000;
 		this.files.set(path, { data: new Uint8Array(data.slice(0)), mtime, ctime: options?.ctime ?? mtime });
+		this.onWrite?.(path);
 	}
 	async append(path: string, data: string) {
 		await this.write(path, (this.text(path) ?? "") + data);

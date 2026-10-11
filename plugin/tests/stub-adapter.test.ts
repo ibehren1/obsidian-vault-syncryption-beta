@@ -66,6 +66,20 @@ describe("StubAdapter", () => {
 		expect(store.entries.size).toBe(0);
 	});
 
+	it("restores every file, even when Obsidian's modify events would convert them back", async () => {
+		const { disk, store, stub, adapter } = setup();
+		await adapter.write("R/a.md", "alpha");
+		await adapter.write("R/b.md", "beta");
+		// Obsidian's modify event for a restored file: the plugin converts files written outside the wrapper.
+		const converts: Promise<boolean>[] = [];
+		disk.onWrite = (path) => converts.push(stub.convert(path));
+		expect(await stub.restoreAll()).toEqual([]);
+		expect(await Promise.all(converts)).toEqual([false, false]);
+		expect(disk.text("R/a.md")).toBe("alpha");
+		expect(disk.text("R/b.md")).toBe("beta");
+		expect(store.entries.size).toBe(0);
+	});
+
 	it("appends and processes through the store", async () => {
 		const { disk, adapter } = setup();
 		await adapter.write("R/a.md", "one");

@@ -253,6 +253,11 @@ path beside the Vault API. Instead:
 - **Disconnecting stops a running sync.** Locking, losing the connection to a lock from
   another device, and unloading the plugin close the engine. A sync that is still running
   fails at its next write or commit, so it can't commit what it reads after that.
+- **Back to a full device without converting back.** Writing a file back to disk fires
+  Obsidian's `modify` event, and a remote-only device moves a file written outside the
+  wrapper into the store. During the restore that would move each file back and leave an
+  empty stub, and the store is deleted right after. So once the restore starts, the
+  wrapper converts nothing, and the store is deleted only when every file is back on disk.
 - An offline edit is sealed when it is written. Nothing decrypted is kept beyond
   Obsidian's own caches and the `blob:` URLs of resources, which are dropped on lock.
 

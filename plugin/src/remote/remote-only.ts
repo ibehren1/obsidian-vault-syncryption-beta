@@ -165,7 +165,9 @@ export class RemoteOnly {
 	private async restoreAll(vaultId: string, key: Uint8Array, store: SealedHashStore): Promise<void> {
 		const stub = await this.install(vaultId);
 		stub.unlock(key);
-		for (const path of stub.paths()) await stub.restore(path);
+		const left = await stub.restoreAll();
+		// The store is deleted next: never while it holds the only copy of a file.
+		if (left.length) throw new Error(`${left.length} remote-only files couldn't be put back on disk. Connect again to retry.`);
 		await store.openAll(key);
 		this.teardown();
 		await deleteDatabase(this.entryDb(vaultId));
