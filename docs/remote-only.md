@@ -1,11 +1,10 @@
 # Remote-only devices
 
-Status: **implemented** (plugin 0.1.18, server 0.1.9). The spike (section 9) passed on
-desktop and iOS; Android is untested.
+Remote-only devices work on desktop and iOS. Android is untested.
 
 ## 1. Goal
 A remote-only device keeps no vault plaintext on disk. Note and attachment contents are
-stored on the device only as ciphertext, in the same format the server stores, and the
+stored on the device only sealed under a local key derived from the keyring, and the
 plugin decrypts them in memory when Obsidian reads a file. Removing the device's key from
 the vault leaves everything on the device useless: the device can no longer get the keyring,
 so it can no longer decrypt its own copy.
@@ -17,7 +16,7 @@ The use cases:
   (section 3).
 
 Whether a key is remote-only is decided when it is approved into the vault, and a full
-device can change it later. The rest of Obsidian should not notice the difference.
+device can change it later. The rest of Obsidian works as on a full device.
 
 ### 1.1 Modes and where data lives
 A device is in one of these modes. The arrows are what moves it between them.
@@ -81,20 +80,21 @@ The local key is derived from the keyring (crypto.md 11), and the keyring is onl
 memory and only from the server. So the sealed store on a locked device can't be opened
 without a successful login, and a removed or locked key can't log in.
 
-## 2. Why the crypto already almost works
+## 2. Why removal closes the data
 - The plugin never stores the VDK or the decrypted keyring. It keeps them in memory, and
   stores only a pin (`{version, sha256}`) for rollback checks ([crypto.md](crypto.md)
   section 6.4).
 - The device's private key, in `SecretStorage`, decrypts only the keyring. The keyring lives
   on the server, which hands it out only to active devices of the vault.
-- So a local copy that holds only server-format ciphertext (encrypted meta and chunks,
-  [crypto.md](crypto.md) section 5) can't be opened once the server refuses the keyring.
+- A remote-only device seals its local copy under a key derived from the keyring
+  ([crypto.md](crypto.md) section 11), so the copy can't be opened once the server refuses
+  the keyring.
   That happens as soon as the key is removed: removal deletes the device's sessions, and
   every later login returns `403 device_revoked` ([protocol.md](protocol.md) section 6).
-- Removal already rotates the epoch ([crypto.md](crypto.md) section 8.4), so the device
+- Removal rotates the epoch ([crypto.md](crypto.md) section 8.4), so the device
   can't read anything written afterwards either.
 
-No extra key from the server is needed. What a remote-only device must add is:
+No extra key from the server is needed. What a remote-only device adds is:
 - it never writes plaintext content to disk,
 - it never stores the keyring, and
 - it stops using the keys it holds in memory when it can't reach the server for too long.
@@ -123,8 +123,9 @@ and all data to a removed key.
 lease runs out, and wiping on removal.
 
 ### 3.1 Plaintext outside the plugin's control
-Obsidian and other plugins keep their own copies of some content. The plugin can check for
-some of these and wipe them on removal, but none of this is cryptographic:
+Obsidian and other plugins keep their own copies of some content. The plugin checks for
+File Recovery (section 10) but doesn't remove any of these copies, and none of this is
+cryptographic:
 - **Obsidian's metadata cache** (IndexedDB) stores headings, links, tags, frontmatter and
   section data in plaintext.
 - The **File Recovery** core plugin stores full plaintext snapshots in IndexedDB. A
@@ -154,7 +155,7 @@ some of these and wipe them on removal, but none of this is cryptographic:
   (`403 remote_only`), and other clients reject keyrings that break the rules above.
 - The server keeps a copy (`devices.remote_only`) so it can shorten the sessions and refuse
   management calls. Approval takes an optional body `{"remoteOnly": true}`. The field is
-  optional, so `PROTOCOL_VERSION` stays 1.
+  optional, so `PROTOCOL_VERSION` is unchanged.
 - **Changing the policy later.** A full device can make another active device remote-only,
   or a full device again ("Make remote-only" and "Make full device" in the vault key list).
   It uploads a keyring with the new policy first, then tells the server
@@ -166,22 +167,26 @@ some of these and wipe them on removal, but none of this is cryptographic:
 
 ## 5. Lease and grace period
 - A remote-only device's sessions last 5 minutes (`SESSION_TTL` is 1 hour for full devices).
-  The device logs in again before its session expires, through the long-poll loop that
-  already runs. Each successful login renews the lease.
+  When a session expires, the device's next request gets `401` and logs in again; the
+  long-poll sends one at least every 25 s while the device is online. Each successful
+  login renews the lease. Offline, nothing renews it.
 - The long-poll checks the session again when it wakes, so a removed device is cut off at
   once, not at the end of the current 25 s wait.
 - **Grace period:** how long the device may go without renewing its lease before it locks.
   The server administrator sets it: the default is 24 hours, and it can be changed per vault
   on `/admin` (`vaults.remote_only_grace`, `NULL` meaning the default). The server sends it
-  in the `/auth/verify` response. The value comes from a server that isn't trusted, which is
+  in the `/auth/verify` response (`graceSeconds`). The plugin compares the time since its
+  last successful login with it every 30 seconds, when the app comes back to the
+  foreground, and at every sync tick. The value comes from a server that isn't trusted, which is
   acceptable: a server can only lengthen a lock that depends on the client anyway, and it
   still can't decrypt anything.
 - **Locking** happens when the grace period passes without a renewal. The device:
-  - drops the keyring, the VDK and any decrypted content from memory,
-  - closes the open remote-only files, and
-  - makes reads fail and shows the vault as locked.
+  - disconnects, which drops the keyring and the VDK from memory,
+  - drops the local key and the `blob:` URLs of decrypted resources, and
+  - makes reads and writes of remote-only files fail, and shows why.
 
-  It unlocks at the next successful login.
+  Editors that are already open keep showing what they loaded, but can't save. The device
+  unlocks at the next successful login.
 - **Locking by hand.** The device's own user can lock its files at any time ("Lock
   remote-only files", in the status window and in the compliance report). That locks as
   above, disconnects and forgets the unlocked encryption key. "Unlock remote-only files"
@@ -196,12 +201,14 @@ some of these and wipe them on removal, but none of this is cryptographic:
 - **A cold start offline stays locked.** The keyring is never on disk, so with no server
   there is nothing to decrypt with. This is what makes the data useless after removal.
 - **On `403 device_revoked`** the device:
-  - wipes its plugin database,
-  - deletes the stubs,
-  - clears Obsidian's metadata cache, as far as it can, and
+  - locks,
+  - deletes every note and attachment (everything outside the hidden folders) through the
+    adapter, so changes not uploaded yet are lost,
+  - deletes both of the vault's databases (sync state and sealed content),
+  - forgets the vault, and
   - shows "This device was removed from the vault."
 
-  It does this only when the official plugin is the one running.
+  `configDir` and Obsidian's own caches (3.1) stay. Only the official plugin does this.
 
 ## 6. Presenting files to Obsidian: stub files
 Obsidian reads `configDir` (`app.json`, `community-plugins.json`, the plugins' `main.js`)
@@ -229,9 +236,6 @@ those can change in any update. Stubs need only the documented `DataAdapter` met
 methods are wrapped, which is still fragile, but it is far less code.
 
 ## 7. Local store
-What was built differs from the first design (a store of server-format objects keyed by
-`fileId`, read by the engine through a `VaultFs` of its own). That needed a second sync
-path beside the Vault API. Instead:
 - **Content:** a database of its own, `syncryption-<installId>-<vaultId>-remote`, with two
   object stores keyed by path: `entries` (the content sealed under the local key,
   [crypto.md](crypto.md) section 11) and `info` (size and times, so listing doesn't load
@@ -262,13 +266,13 @@ path beside the Vault API. Instead:
   Obsidian's own caches and the `blob:` URLs of resources, which are dropped on lock.
 
 ## 8. Implementation
-**Backend** (server 0.1.8): migration 7 (`devices.remote_only`, `vaults.remote_only_grace`),
-the approve body, 5-minute sessions and `graceSeconds` in `/auth/verify`, the long-poll
-checking the session when it wakes, `403 remote_only` on approve, remove, recovery and key
-replacement, and the grace setting on `/admin`. Server 0.1.9: migration 8
-(`devices.locked`), the policy and lock endpoints, and `403 device_locked`.
+**Backend:** `devices.remote_only`, `devices.locked` and `vaults.remote_only_grace`; the
+approve body; 5-minute sessions and `graceSeconds` in `/auth/verify`; the long-poll
+checking the session when it wakes; `403 remote_only` on approve, remove, recovery and key
+replacement; the policy and lock endpoints and `403 device_locked`; and the grace setting
+on `/admin`.
 
-**Plugin** (0.1.17; policy changes and locking in 0.1.18):
+**Plugin:**
 - `crypto/keyring.ts`: the `policy` field and the chain rules, with test vectors.
   `crypto/local.ts` and `deriveLocalKey`: the local key.
 - `remote/stub-adapter.ts`: the wrapper. `store/entries.ts`: its IndexedDB store.
@@ -297,32 +301,18 @@ replacement, and the grace setting on `/admin`. Server 0.1.9: migration 8
 - **No management on a remote-only device:** the settings and the status window hide
   approving and removing keys, the recovery key and key replacement. It doesn't offer a
   recovery key and doesn't finish other devices' removals.
-- **Changing another device** (0.1.18): the vault key list of a full device has "Make
+- **Changing another device:** the vault key list of a full device has "Make
   remote-only" or "Make full device" for every other key, and "Lock" or "Unlock" for a
   remote-only one. `VaultSession.setPolicy` updates the keyring, then the server. After
   each sync, a device whose keyring policy differs from its local flag connects again.
-- **Lock and unlock on the device** (0.1.18): commands, a button in the status window and
+- **Lock and unlock on the device:** commands, a button in the status window and
   one in the compliance report. `403 device_locked` locks the files and leaves the device
   offline, retrying.
 - **Compliance report** (section 10).
 
-## 9. Spike
-Before any of this is built, a throwaway spike checks that wrapping the adapter works, on
-desktop, iOS and Android:
-- the file tree, opening, editing and saving notes,
-- rename, move and delete,
-- the metadata cache, links, backlinks, tags and search,
-- images, PDFs, audio and video through `blob:` URLs,
-- Canvas and Bases,
-- that Obsidian's own reads and writes all go through the wrapped methods (none read the
-  disk directly),
-- that the file watcher doesn't treat a stub as a change that overwrites the store,
-- start-up with the vault locked.
-
-The results go here, with a go or no-go decision.
-
-### 9.1 Code reading (Obsidian 1.14.4 desktop `app.js`)
-These were checked in the app bundle before any testing on a device:
+## 9. How Obsidian uses the adapter
+Checked in Obsidian 1.14.4's desktop `app.js`, and tested on macOS desktop and iOS
+(Android is untested):
 - **`Vault.read`, `readBinary`, `cachedRead`, `modify`, `process` and `copy`** call
   `this.adapter.<method>(path)` on the adapter instance. Replacing the methods on that
   instance catches them. `cachedRead` is served from `Vault`'s own in-memory content cache
@@ -333,73 +323,20 @@ These were checked in the app bundle before any testing on a device:
   the new `mtime`, so Obsidian sees the change and indexes it again.
 - **After a write**, the desktop and mobile adapters both `stat` the file on disk
   (`reconcileInternalFile`) and update `TFile.stat` from that. So `TFile.stat.size` is 0
-  for stubs. The wrapped `adapter.stat` returns the real size, but `TFile.stat` doesn't use
-  it. The effects are cosmetic, plus a sync scan that hashes these files every time.
+  for stubs: the wrapped `adapter.stat` returns the real size, but `TFile.stat` doesn't use
+  it. Obsidian's file sizes are cosmetic; the sync scan gets the real sizes from
+  `RemoteStatFs` (section 7).
 - **`getResourcePath` is synchronous.** Electron's `app://` protocol is handled in the main
   process, and Obsidian doesn't register a service worker, so a plugin can't serve
-  decrypted bytes behind a URL on demand. The spike returns a `blob:` URL once the file is
-  decrypted. On a cache miss it returns the stub's URL (empty), decrypts in the background
-  and asks the views to render again. It also decrypts a note's embeds when the note is
-  opened.
+  decrypted bytes behind a URL on demand. The wrapper returns a `blob:` URL once the file
+  is decrypted. On a cache miss it returns the stub's URL (empty), decrypts in the
+  background and asks the views to render again. It also decrypts a note's embeds when the
+  note is opened.
 - **`getFullPath`** (the real path on disk) is used outside the adapter only for "Copy path"
   and opening a file in another app. Those see the stub.
-
-### 9.2 Spike build
-The spike's wiring (`spike.ts`) was removed when the feature was built (section 8).
-- `plugin/src/remote/stub-adapter.ts` holds the wrapper. It has unit tests in
-  `tests/stub-adapter.test.ts`.
-- `plugin/src/remote/spike.ts` connects it to Obsidian. It covers only the
-  `remote-only-spike` folder, and stays off until the "Remote-only spike: enable on this
-  device" command is run on that device.
-- The key is random and kept in `SecretStorage`, standing in for the keyring.
-- The store keys entries by path.
-- The spike isn't connected to sync. Notes in the folder still sync through the Vault API,
-  which now returns the decrypted content.
-
-### 9.3 Manual checks (desktop, iOS, Android)
-1. Run "enable", then put notes, images, a PDF, an audio file, a canvas and a base in
-   `remote-only-spike`.
-2. Run "convert", then "report". Every file should be empty on disk.
-3. Open, edit and save notes. Check links, backlinks, tags, search, embeds, Canvas and
-   Bases.
-4. Rename, move and delete files and folders, both inside the folder and into and out of
-   it. Run "report" after each step.
-5. Restart Obsidian. Check that the content and the metadata are still right.
-6. Run "lock". Opening a remote-only note should fail, and the rest of the vault should
-   still work. Then run "unlock".
-7. Run "restore", then "disable".
-
-### 9.4 Results
-**Desktop (macOS, 2026-10-07, plugin 0.1.14):**
-- Every file in the folder was 0 bytes on disk (`ls -l`).
-- "convert" reported no files converted. This is expected for files created or saved in
-  Obsidian while the spike is on, because those are written as stubs straight away. The
-  notice now also counts the files that already were stubs (0.1.15).
-- Opening, closing and editing notes worked.
-- After "lock", the files couldn't be read. After "unlock", they could be read again.
-- "restore" put the files back as normal files.
-
-**Desktop (macOS, 2026-10-07, plugin 0.1.15):** the rest of 9.3 passed as well:
-- rename and move, inside the folder and into and out of it,
-- restarting Obsidian,
-- links, backlinks, tags and search,
-- embedded images, PDFs and audio,
-- Canvas and Bases.
-
-**iOS (2026-10-10, plugin 0.1.15, installed through BRAT from the beta repo):**
-- After "enable", the files in the folder could be read and written.
-- "report" counted 0 files non-empty on disk, so every file in the folder is a stub.
-- "convert" found nothing to convert, as on desktop: the files were already stubs, because
-  every write through the adapter while the spike is on leaves a stub.
-- After "lock", the files couldn't be read. After "unlock", they could be read again.
-- Rename and move worked.
-- Restarting Obsidian, links and search, embedded images, PDFs and audio, Canvas and Bases,
-  and "restore" all worked as well.
-
-**Not checked yet:** Android. There is no Android device; the Android emulator is an option.
-
-**Decision (2026-10-10): go.** Desktop and iOS pass every check in 9.3, and the user decided to
-build remote-only devices. Android is still untested; the README asks for Android testers.
+- Checked on desktop and iOS: the file tree, opening, editing and saving notes; rename,
+  move and delete; links, backlinks, tags and search; embedded images, PDFs and audio;
+  Canvas and Bases; restarting Obsidian; locking and unlocking.
 
 ## 10. Compliance report
 "Show remote-only compliance report" (also a button in the status window) checks the

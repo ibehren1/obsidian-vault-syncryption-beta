@@ -395,7 +395,7 @@ async function create(
 }
 
 /**
- * Replace this device's key, active side (PLAN, Rules: Replace). `old` is the connected
+ * Replace this device's key, active side. `old` is the connected
  * session of the current key, `api` a client for the new key, which isn't saved yet.
  *
  * 1. The new key logs in once, so the server knows it as a pending key of the vault.

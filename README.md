@@ -28,7 +28,7 @@ Some devices shouldn't keep a readable copy of your vault: a shared or work comp
 - **No vault management.** A remote-only device can't approve or remove keys or create a recovery key, so a stolen one can't let anyone else in.
 - **Compliance report.** Each remote-only device can show what it enforces right now: no plaintext on disk, File Recovery off, sealed content hashes and a valid lease.
 
-The config folder (settings, themes, plugins) stays in plaintext so Obsidian can start. See [docs/remote-only.md](docs/remote-only.md) for the design, a diagram of where data lives in each mode, and the limits.
+The config folder (settings, themes, plugins) stays in plaintext so Obsidian can start. See [docs/remote-only.md](docs/remote-only.md) for how it works, a diagram of where data lives in each mode, and the limits.
 
 ## A server you'll actually enjoy running
 - **One container**, configured with a few environment variables in [`backend/docker/docker-compose.yml`](backend/docker/docker-compose.yml).
@@ -72,8 +72,8 @@ The plugin syncs the whole vault in place, including the config folder (`.obsidi
 ## Documentation
 - [docs/self-hosting.md](docs/self-hosting.md): running the server
 - [docs/scaling.md](docs/scaling.md): storage growth and capacity
+- [docs/remote-only.md](docs/remote-only.md): remote-only devices
 - [docs/architecture.md](docs/architecture.md), [docs/protocol.md](docs/protocol.md) and [docs/crypto.md](docs/crypto.md): how it works
-- [docs/PLAN.md](docs/PLAN.md): the design
 - [SECURITY.md](SECURITY.md): reporting a vulnerability
 
 ## Repository
@@ -81,7 +81,7 @@ The plugin syncs the whole vault in place, including the config folder (`.obsidi
 |---|---|
 | `plugin/` | Obsidian plugin (TypeScript) |
 | `backend/` | Sync server (Python, uv, FastAPI) and container |
-| `docs/` | Design and specifications |
+| `docs/` | How it works, specifications and self-hosting |
 
 ## License
 [MIT](LICENSE)

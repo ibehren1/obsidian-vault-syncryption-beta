@@ -464,6 +464,7 @@ th, td {
   vertical-align: top;
 }
 td.num { text-align: right; }
+pre { background: #f6f6f6; border: 1px solid #ddd; border-radius: 6px; padding: .75rem; }
 .muted { color: #777; }
 .tag { font-size: .8rem; padding: 0 .4rem; border-radius: 4px; background: #c33; color: #fff; }
 form.inline { display: inline; }

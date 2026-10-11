@@ -1,4 +1,4 @@
-/** Settings: endpoint, username, vault name, device name, the device key and the exclude list (docs/PLAN.md). */
+/** Settings: endpoint, username, vault name, device name, the device key and the exclude list (docs/architecture.md 4.4). */
 import { App, type ButtonComponent, Notice, Platform, PluginSettingTab, type Setting, type SettingDefinition, type SettingDefinitionGroup, type SettingDefinitionItem } from "obsidian";
 
 import { type Device, normalizeEndpoint } from "./api/client";

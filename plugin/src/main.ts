@@ -1093,7 +1093,7 @@ export default class SyncryptionPlugin extends Plugin {
 	}
 
 	/**
-	 * Replace this device's key (PLAN, Rules: Replace): the connected old key approves the
+	 * Replace this device's key: the connected old key approves the
 	 * new one, the new key is saved, and after a restart the new key removes the old one and
 	 * rotates the vault key. The old key stays in the slot until the new one is approved.
 	 */
