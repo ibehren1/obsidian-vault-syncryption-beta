@@ -67,6 +67,7 @@ export async function pairedDevice(
 	vaultName: string,
 	name: string,
 	seed = newSeed(),
+	opts: { remoteOnly?: boolean } = {},
 ): Promise<Device> {
 	const second = device(username, vaultName, name, seed);
 	let failed: unknown = null;
@@ -75,7 +76,7 @@ export async function pairedDevice(
 		if (failed) throw failed;
 		const pending = await first.session.pendingDevices();
 		if (pending.length) {
-			await first.session.approve(pending[0]!.device);
+			await first.session.approve(pending[0]!.device, opts);
 			break;
 		}
 		await new Promise((r) => setTimeout(r, 20));

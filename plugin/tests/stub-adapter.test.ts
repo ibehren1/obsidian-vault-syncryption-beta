@@ -89,7 +89,7 @@ function setup() {
 	const revoked: string[] = [];
 	const ready: string[] = [];
 	const stub = new StubAdapter({
-		folder: "R",
+		isRemote: (p) => p.startsWith("R/"),
 		store,
 		onResource: (p) => ready.push(p),
 		urls: {
@@ -110,7 +110,7 @@ function storedBytes(store: MemoryEntryStore): string {
 	return [...store.entries.values()].map((e) => dec.decode(e.data)).join("|");
 }
 
-describe("StubAdapter (spike)", () => {
+describe("StubAdapter", () => {
 	it("keeps remote-only content only in the store, as ciphertext, and leaves empty stubs", async () => {
 		const { disk, store, adapter } = setup();
 		await adapter.write("R/note.md", "secret plan", { mtime: 2000 });
@@ -226,6 +226,20 @@ describe("StubAdapter (spike)", () => {
 		expect(revoked).toEqual(["blob:0", "blob:1"]);
 		expect(created).toHaveLength(2);
 		expect(adapter.getResourcePath("plain.png")).toBe("app://disk/plain.png");
+	});
+
+	it("loads the index from the store and reports the real sizes", async () => {
+		const { store, adapter } = setup();
+		await adapter.write("R/a.md", "hello");
+		const again = new StubAdapter({ isRemote: (p) => p.startsWith("R/"), store });
+		const disk = new FakeDisk();
+		disk.put("R/a.md", "", 3000);
+		again.install(disk);
+		await again.load();
+		again.unlock(KEY);
+		expect(again.paths()).toEqual(["R/a.md"]);
+		expect(again.info("R/a.md")).toMatchObject({ size: 5 });
+		expect(await disk.read("R/a.md")).toBe("hello");
 	});
 
 	it("puts the original methods back on uninstall", async () => {

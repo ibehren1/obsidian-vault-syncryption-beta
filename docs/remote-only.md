@@ -1,7 +1,7 @@
 # Remote-only devices
 
-Status: **proposed**. Nothing here is implemented yet. A spike (section 9) decides whether
-it goes ahead.
+Status: **implemented** (plugin 0.1.18, server 0.1.9). The spike (section 9) passed on
+desktop and iOS; Android is untested.
 
 ## 1. Goal
 A remote-only device keeps no vault plaintext on disk. Note and attachment contents are
@@ -16,8 +16,70 @@ The use cases:
   readable copy, as long as their client followed the rules while they were a member
   (section 3).
 
-Whether a key is remote-only is decided when it is approved into the vault. The rest of
-Obsidian should not notice the difference.
+Whether a key is remote-only is decided when it is approved into the vault, and a full
+device can change it later. The rest of Obsidian should not notice the difference.
+
+### 1.1 Modes and where data lives
+A device is in one of these modes. The arrows are what moves it between them.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    Full: Full device
+    Unlocked: Remote-only, unlocked
+    Locked: Remote-only, locked
+    Wiped: Removed and wiped
+
+    [*] --> Full: approved
+    [*] --> Unlocked: approved as remote-only
+    Full --> Unlocked: a full device makes it remote-only<br/>(files move into the sealed store)
+    Unlocked --> Full: a full device makes it a full device<br/>(files go back on disk)
+    Unlocked --> Locked: locked on the device, locked by<br/>another device, grace period over,<br/>File Recovery on, Obsidian closed
+    Locked --> Unlocked: login, while not locked by<br/>another device
+    Unlocked --> Wiped: key removed (403 device_revoked)
+    Locked --> Wiped: key removed, at the next login
+    Full --> [*]: key removed (files stay)
+```
+
+Where each piece of data is in each mode:
+
+```mermaid
+flowchart TB
+    subgraph Server["Server (every mode)"]
+        S1["Ciphertext: file meta, chunks, paths"]
+        S2["Sealed keyring (VDK wrapped to each key)"]
+        S3["Device rows: remote_only, locked, sessions"]
+    end
+    subgraph FullDev["Full device"]
+        F1["Disk: notes and attachments in plaintext"]
+        F2["Disk: configDir in plaintext"]
+        F3["IndexedDB: sync state, plaintext content hashes"]
+        F4["SecretStorage: private encryption key"]
+        F5["Memory: keyring, VDK"]
+    end
+    subgraph RemUnlocked["Remote-only, unlocked"]
+        U1["Disk: zero-byte stubs (paths readable)"]
+        U2["Disk: configDir in plaintext"]
+        U3["IndexedDB: content sealed under the local key,<br/>sync state with sealed hashes"]
+        U4["SecretStorage: private encryption key"]
+        U5["Memory: keyring, VDK, local key,<br/>decrypted content while open"]
+    end
+    subgraph RemLocked["Remote-only, locked"]
+        L1["Disk: zero-byte stubs"]
+        L2["Disk: configDir in plaintext"]
+        L3["IndexedDB: sealed content and hashes"]
+        L4["SecretStorage: private encryption key"]
+        L5["Memory: nothing of the vault"]
+    end
+    subgraph Wiped["Removed and wiped"]
+        W1["Disk: configDir only"]
+        W2["SecretStorage: a key the server refuses"]
+    end
+```
+
+The local key is derived from the keyring (crypto.md 11), and the keyring is only in
+memory and only from the server. So the sealed store on a locked device can't be opened
+without a successful login, and a removed or locked key can't log in.
 
 ## 2. Why the crypto already almost works
 - The plugin never stores the VDK or the decrypted keyring. It keeps them in memory, and
@@ -93,6 +155,14 @@ some of these and wipe them on removal, but none of this is cryptographic:
 - The server keeps a copy (`devices.remote_only`) so it can shorten the sessions and refuse
   management calls. Approval takes an optional body `{"remoteOnly": true}`. The field is
   optional, so `PROTOCOL_VERSION` stays 1.
+- **Changing the policy later.** A full device can make another active device remote-only,
+  or a full device again ("Make remote-only" and "Make full device" in the vault key list).
+  It uploads a keyring with the new policy first, then tells the server
+  (`PUT .../devices/{id}/policy`, [protocol.md](protocol.md) section 6), which wakes the
+  vault's long-polls. The changed device sees the new keyring at its next sync and
+  connects again to follow it: becoming remote-only moves its files into the sealed store,
+  becoming full puts them back on disk. A device can't change its own policy: a
+  remote-only one can't manage the vault, and a full one asks another full device.
 
 ## 5. Lease and grace period
 - A remote-only device's sessions last 5 minutes (`SESSION_TTL` is 1 hour for full devices).
@@ -112,6 +182,17 @@ some of these and wipe them on removal, but none of this is cryptographic:
   - makes reads fail and shows the vault as locked.
 
   It unlocks at the next successful login.
+- **Locking by hand.** The device's own user can lock its files at any time ("Lock
+  remote-only files", in the status window and in the compliance report). That locks as
+  above, disconnects and forgets the unlocked encryption key. "Unlock remote-only files"
+  connects again.
+- **Locking from another device.** A full device can lock a remote-only device ("Lock" in
+  the vault key list, `PUT .../devices/{id}/lock`). The server ends its sessions and
+  refuses its logins and requests with `403 device_locked` until a full device unlocks it.
+  The locked device locks its files, keeps everything (nothing is wiped) and tries again
+  at every sync tick, so it opens again by itself once unlocked. Use it for a device that
+  is missing but may come back; remove the key when it won't. Making the device a full
+  device also clears the lock.
 - **A cold start offline stays locked.** The keyring is never on disk, so with no server
   there is nothing to decrypt with. This is what makes the data useless after removal.
 - **On `403 device_revoked`** the device:
@@ -148,36 +229,69 @@ those can change in any update. Stubs need only the documented `DataAdapter` met
 methods are wrapped, which is still fragile, but it is far less code.
 
 ## 7. Local store
-The remote-only store goes in the same IndexedDB database as the rest of the plugin's
-state ([architecture.md](architecture.md)):
-- `blobs`: server-format objects (encrypted meta and chunks), keyed by blob id. They are
-  filled on pull and opened on read.
-- `files` and `outbox` keyed by `fileId`, not by path. The path is only in the encrypted
-  meta, and no plaintext hash is stored.
-- A local edit is sealed with the current epoch when it is written, and stored as a pending
-  revision. An offline edit therefore never reaches the disk in plaintext.
-- Decrypted content may be kept in a small in-memory cache, only while the lease is valid.
+What was built differs from the first design (a store of server-format objects keyed by
+`fileId`, read by the engine through a `VaultFs` of its own). That needed a second sync
+path beside the Vault API. Instead:
+- **Content:** a database of its own, `syncryption-<installId>-<vaultId>-remote`, with two
+  object stores keyed by path: `entries` (the content sealed under the local key,
+  [crypto.md](crypto.md) section 11) and `info` (size and times, so listing doesn't load
+  the content). A database of its own, so the wipe can delete it whole.
+- **Sync goes through the wrapper.** The engine reads and writes notes through the Vault
+  API like on a full device, and the Vault API goes through the wrapped adapter. A pulled
+  file is sealed into the store and leaves a stub; an upload reads the store. A
+  `VaultFs` decorator (`RemoteStatFs`) reports the stored size and times, as `TFile.stat`
+  has the stub's (size 0) and the scan would hash every file on every sync.
+- **Sync state:** the same database as a full device. Its plaintext content hashes
+  (`files.sha256`) would let anyone confirm a guess of a file's content, so a remote-only
+  device stores them sealed (`s1:`, crypto.md 11). Storing a file fails while locked.
+- Paths are in plaintext on disk anyway (the stubs), so keying by path hides nothing more.
+- An offline edit is sealed when it is written. Nothing decrypted is kept beyond
+  Obsidian's own caches and the `blob:` URLs of resources, which are dropped on lock.
 
-The sync engine reads and writes this store through a `VaultFs` of its own, so a sync
-doesn't go through the disk.
+## 8. Implementation
+**Backend** (server 0.1.8): migration 7 (`devices.remote_only`, `vaults.remote_only_grace`),
+the approve body, 5-minute sessions and `graceSeconds` in `/auth/verify`, the long-poll
+checking the session when it wakes, `403 remote_only` on approve, remove, recovery and key
+replacement, and the grace setting on `/admin`. Server 0.1.9: migration 8
+(`devices.locked`), the policy and lock endpoints, and `403 device_locked`.
 
-## 8. Changes by component
-**Backend:**
-- Migration 7: `devices.remote_only` and `vaults.remote_only_grace`.
-- The approve body.
-- The short session lifetime, and `graceSeconds` in `/auth/verify`.
-- The long-poll checks the session again when it wakes.
-- `403 remote_only` on approve, remove, recovery and key replacement.
-- The grace setting on `/admin`.
-
-**Plugin:**
-- The keyring `policy` field and the chain rules, with test vectors.
-- The approval choice.
-- `device_revoked` handling. Today the plugin treats a removed key as a generic error and
-  keeps retrying. This part is useful for every device.
-- The lease manager, locking and the wipe.
-- The encrypted store and its `VaultFs`.
-- The adapter wrapper and stubs.
+**Plugin** (0.1.17; policy changes and locking in 0.1.18):
+- `crypto/keyring.ts`: the `policy` field and the chain rules, with test vectors.
+  `crypto/local.ts` and `deriveLocalKey`: the local key.
+- `remote/stub-adapter.ts`: the wrapper. `store/entries.ts`: its IndexedDB store.
+  `store/sealed.ts`: the sealed hashes. `remote/stat-fs.ts`: the real sizes for the scan.
+- `remote/remote-only.ts`: the controller.
+  - **At load:** if this device is remote-only (`syncryption-remote-only` in local
+    storage, `{vaultId}`), the wrapper is installed locked before anything else.
+  - **After each connection** it follows this device's policy in the keyring. If the
+    keyring says remote-only, it checks File Recovery, unlocks, seals the hashes, turns
+    every file still on disk into a stub and has Obsidian index the notes again. If the
+    keyring says full but the device is still remote-only, every file goes back on disk
+    and the store is deleted. Remote-only files of another vault stop sync with an error.
+  - **Lease:** every 30 seconds, on wake-up and at every sync tick, the device checks the
+    time since its last login against the grace period. When it has passed, or File
+    Recovery is on, it locks, disconnects and shows why. The next successful connection
+    unlocks it.
+  - **Removal:** on `403 device_revoked` (from a sync, a login or the long-poll) it locks,
+    deletes every note and attachment (everything outside the hidden folders) through the
+    adapter, deletes both databases of the vault, and forgets the vault. Changes not
+    uploaded yet are lost with it. `configDir` stays.
+  - A file written to disk by something other than Obsidian is moved into the store on its
+    `create` or `modify` event.
+- **Approval:** the approval dialog has "Approve as remote-only" next to "Codes match,
+  approve". The approving device adds the key with the policy, then approves it on the
+  server with `{"remoteOnly": true}`.
+- **No management on a remote-only device:** the settings and the status window hide
+  approving and removing keys, the recovery key and key replacement. It doesn't offer a
+  recovery key and doesn't finish other devices' removals.
+- **Changing another device** (0.1.18): the vault key list of a full device has "Make
+  remote-only" or "Make full device" for every other key, and "Lock" or "Unlock" for a
+  remote-only one. `VaultSession.setPolicy` updates the keyring, then the server. After
+  each sync, a device whose keyring policy differs from its local flag connects again.
+- **Lock and unlock on the device** (0.1.18): commands, a button in the status window and
+  one in the compliance report. `403 device_locked` locks the files and leaves the device
+  offline, retrying.
+- **Compliance report** (section 10).
 
 ## 9. Spike
 Before any of this is built, a throwaway spike checks that wrapping the adapter works, on
@@ -218,6 +332,7 @@ These were checked in the app bundle before any testing on a device:
   and opening a file in another app. Those see the stub.
 
 ### 9.2 Spike build
+The spike's wiring (`spike.ts`) was removed when the feature was built (section 8).
 - `plugin/src/remote/stub-adapter.ts` holds the wrapper. It has unit tests in
   `tests/stub-adapter.test.ts`.
 - `plugin/src/remote/spike.ts` connects it to Obsidian. It covers only the
@@ -258,4 +373,33 @@ These were checked in the app bundle before any testing on a device:
 - embedded images, PDFs and audio,
 - Canvas and Bases.
 
-**Not checked yet:** iOS and Android. iOS waits for a build BRAT can install. There is no Android device; the Android emulator is an option.
+**iOS (2026-10-10, plugin 0.1.15, installed through BRAT from the beta repo):**
+- After "enable", the files in the folder could be read and written.
+- "report" counted 0 files non-empty on disk, so every file in the folder is a stub.
+- "convert" found nothing to convert, as on desktop: the files were already stubs, because
+  every write through the adapter while the spike is on leaves a stub.
+- After "lock", the files couldn't be read. After "unlock", they could be read again.
+- Rename and move worked.
+- Restarting Obsidian, links and search, embedded images, PDFs and audio, Canvas and Bases,
+  and "restore" all worked as well.
+
+**Not checked yet:** Android. There is no Android device; the Android emulator is an option.
+
+**Decision (2026-10-10): go.** Desktop and iOS pass every check in 9.3, and the user decided to
+build remote-only devices. Android is still untested; the README asks for Android testers.
+
+## 10. Compliance report
+"Show remote-only compliance report" (also a button in the status window) checks the
+device now and shows the result:
+- the policy, from the keyring when connected, or what the device remembers;
+- that the policy is remembered and the wrapper is installed;
+- that no remote-only file has content on disk (lists the ones that do);
+- that File Recovery is off;
+- that the content hashes are sealed;
+- that the lease is valid or the files are locked;
+- the details: locked or not, the last renewal, the grace period, the number of
+  remote-only files and of stored entries, and any mismatch between them.
+
+It says "Compliant" only when every check passes. It checks only what the plugin enforces:
+the caches in 3.1 are outside it, and File Recovery snapshots taken before the device
+became remote-only stay in File Recovery's own database.

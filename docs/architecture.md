@@ -282,7 +282,8 @@ clean stop. CI runs it in the `container` job.
 | `crypto` | OpenSSH key parser/writer, age `ssh-ed25519` recipient/identity, sshsig, keyring, file and metadata objects |
 | `api` | typed client over a `Transport` (`requestUrl` in the plugin, `fetch` in tests). `src/api/schema.ts` is generated from the server's OpenAPI with `npm run api-types` (CI checks it is current) |
 | `sync` | vault session (login, join, create or open the vault, pairing, keyring pinning), sync engine, scanner, merge, conflict copies, path filter, the `VaultFs` over `vault.adapter` for the config folders, lock manager, long-poll loop |
-| `store` | IndexedDB: cursor, path table, outbox, pinned keyring |
+| `store` | IndexedDB: cursor, path table, outbox, pinned keyring. On a remote-only device, the sealed content hashes (`sealed`) and the store of sealed file content (`entries`) |
+| `remote` | remote-only devices ([remote-only.md](remote-only.md)): the wrapped `vault.adapter` over zero-byte stubs, the lease, the wipe on removal and the compliance report |
 
 ### 4.1 Local state (IndexedDB)
 One database per Obsidian vault and remote vault: `syncryption-<installId>-<vaultId>`. The
@@ -295,6 +296,10 @@ cleared.
 | `meta` | `cursor`, `vaultId`, pinned keyring `keyringPin` `{version, sha256}`, `deferred` (remote revisions held back until the end of a pull, see 4.2), `failed` (remote revisions that couldn't be written here, tried again on every pull) |
 | `files` | `path → {fileId, rev, deleted, sha256, size, mtime}`: the last synced state of each file |
 | `outbox` | `path → {path, id, queuedAt}`, one entry per path. Whether it is an upload or a deletion is decided when it is pushed, from the file on disk. A push removes the entry only if its `id` is unchanged, so a change made during the push is not lost |
+
+A remote-only device ([remote-only.md](remote-only.md) section 7) stores `files.sha256`
+sealed under its local key, and the content of its notes and attachments in a second
+database, `syncryption-<installId>-<vaultId>-remote`.
 
 There is no store of merge bases: the base is the synced revision, fetched from the server
 with `GET /files/{fileId}/revs/{rev}` when a merge needs it. A merge therefore needs the

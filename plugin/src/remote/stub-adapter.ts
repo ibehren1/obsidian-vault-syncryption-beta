@@ -1,27 +1,30 @@
 /**
- * SPIKE (docs/remote-only.md section 9): remote-only files as zero-byte stubs on disk, with the
- * content encrypted in a local store and served through a wrapped `app.vault.adapter`.
- * Throwaway code to see whether Obsidian works on top of it; not wired into sync.
+ * Remote-only files (docs/remote-only.md 6): zero-byte stubs on disk, with the content sealed
+ * under the local key (crypto.md 11) in a local store and served through a wrapped
+ * `app.vault.adapter`. Sync goes through the Vault API, so it goes through the wrapper too.
  */
-import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
-import { randomBytes } from "@noble/ciphers/utils.js";
-
 import { concat, fromUtf8, utf8 } from "../crypto/bytes";
+import { openLocal, sealLocal } from "../crypto/local";
 
-/** One remote-only file in the local store. The spike keys it by path; the design keys by fileId. */
-export interface SealedEntry {
-	nonce: Uint8Array;
-	data: Uint8Array;
+/** The size and times of a remote-only file, kept next to its sealed content. */
+export interface EntryInfo {
 	size: number;
 	mtime: number;
 	ctime: number;
+}
+
+/** One remote-only file in the local store, keyed by its path. */
+export interface SealedEntry extends EntryInfo {
+	nonce: Uint8Array;
+	data: Uint8Array;
 }
 
 export interface EntryStore {
 	get(path: string): Promise<SealedEntry | undefined>;
 	put(path: string, entry: SealedEntry): Promise<void>;
 	delete(path: string): Promise<void>;
-	paths(): Promise<string[]>;
+	/** Every entry's size and times, without the content. */
+	infos(): Promise<Map<string, EntryInfo>>;
 }
 
 export class MemoryEntryStore implements EntryStore {
@@ -35,8 +38,8 @@ export class MemoryEntryStore implements EntryStore {
 	async delete(path: string) {
 		this.entries.delete(path);
 	}
-	async paths() {
-		return [...this.entries.keys()];
+	async infos() {
+		return new Map([...this.entries].map(([p, { size, mtime, ctime }]) => [p, { size, mtime, ctime }]));
 	}
 }
 
@@ -115,8 +118,8 @@ function buffer(data: Uint8Array): ArrayBuffer {
 const EMPTY = new ArrayBuffer(0);
 
 export interface StubAdapterOptions {
-	/** Paths under this folder are remote-only. */
-	folder: string;
+	/** Whether a vault path is remote-only: not for `configDir` and other hidden paths. */
+	isRemote(path: string): boolean;
 	store: EntryStore;
 	/** Called when a resource URL becomes available, so the view can render it again. */
 	onResource?: (path: string) => void;
@@ -130,6 +133,8 @@ export class StubAdapter {
 	private readonly queues = new Map<string, Promise<unknown>>();
 	private readonly resources = new Map<string, string>();
 	private readonly warming = new Set<string>();
+	/** The store's entries without their content, loaded by `load`. */
+	private readonly index = new Map<string, EntryInfo>();
 	private readonly urls: { create(blob: Blob): string; revoke(url: string): void };
 
 	constructor(private readonly opts: StubAdapterOptions) {
@@ -152,7 +157,23 @@ export class StubAdapter {
 	}
 
 	isRemote(path: string): boolean {
-		return path.replace(/^\/+/, "").startsWith(`${this.opts.folder}/`);
+		return this.opts.isRemote(path.replace(/^\/+/, ""));
+	}
+
+	/** Read the store's index. Call once, before Obsidian reads through the wrapper. */
+	async load(): Promise<void> {
+		this.index.clear();
+		for (const [path, info] of await this.opts.store.infos()) this.index.set(path, info);
+	}
+
+	/** The paths in the store. */
+	paths(): string[] {
+		return [...this.index.keys()];
+	}
+
+	/** The real size and times of a file in the store. */
+	info(path: string): EntryInfo | undefined {
+		return this.index.get(path);
 	}
 
 	/** Replaces the adapter's methods on the instance. Returns the function that puts them back. */
@@ -178,7 +199,8 @@ export class StubAdapter {
 		};
 	}
 
-	private get raw(): WrappedAdapter {
+	/** The adapter's own methods, which read and write the disk as it is. */
+	get raw(): WrappedAdapter {
 		if (!this.orig) throw new Error("The stub adapter isn't installed.");
 		return this.orig;
 	}
@@ -201,13 +223,23 @@ export class StubAdapter {
 	}
 
 	private seal(path: string, plain: Uint8Array, mtime: number, ctime: number): SealedEntry {
-		const nonce = randomBytes(24);
-		const data = xchacha20poly1305(this.requireKey(), nonce, utf8(path)).encrypt(plain);
+		const { nonce, data } = sealLocal(this.requireKey(), "local-content", path, plain);
 		return { nonce, data, size: plain.length, mtime, ctime };
 	}
 
 	private open(path: string, entry: SealedEntry): Uint8Array {
-		return xchacha20poly1305(this.requireKey(), entry.nonce, utf8(path)).decrypt(entry.data);
+		return openLocal(this.requireKey(), "local-content", path, entry.nonce, entry.data);
+	}
+
+	private async store(path: string, entry: SealedEntry): Promise<void> {
+		await this.opts.store.put(path, entry);
+		this.index.set(path, { size: entry.size, mtime: entry.mtime, ctime: entry.ctime });
+	}
+
+	private async drop(path: string): Promise<void> {
+		await this.opts.store.delete(path);
+		this.index.delete(path);
+		this.dropResource(path);
 	}
 
 	/** The plaintext of a remote-only file. A file not yet in the store is read from disk. */
@@ -220,10 +252,10 @@ export class StubAdapter {
 
 	/** Stores the content and leaves an empty stub with the file's times, so Obsidian sees a change. */
 	private async put(path: string, plain: Uint8Array, options?: WriteOptions): Promise<void> {
-		const prev = await this.opts.store.get(path);
+		const prev = this.index.get(path);
 		const mtime = options?.mtime ?? Date.now();
 		const ctime = prev?.ctime ?? options?.ctime ?? mtime;
-		await this.opts.store.put(path, this.seal(path, plain, mtime, ctime));
+		await this.store(path, this.seal(path, plain, mtime, ctime));
 		this.dropResource(path);
 		await this.raw.writeBinary(path, EMPTY, { ...options, mtime, ctime });
 	}
@@ -240,7 +272,7 @@ export class StubAdapter {
 			const stat = await this.raw.stat(path);
 			if (stat?.type !== "file") return false;
 			const plain = new Uint8Array(await this.raw.readBinary(path));
-			if (plain.length === 0 && (await this.opts.store.get(path))) return false;
+			if (plain.length === 0 && this.index.has(path)) return false;
 			await this.put(path, plain, { mtime: stat.mtime, ctime: stat.ctime });
 			return true;
 		});
@@ -252,8 +284,7 @@ export class StubAdapter {
 			const entry = await this.opts.store.get(path);
 			if (!entry) return false;
 			await this.raw.writeBinary(path, buffer(this.open(path, entry)), { mtime: entry.mtime, ctime: entry.ctime });
-			await this.opts.store.delete(path);
-			this.dropResource(path);
+			await this.drop(path);
 			return true;
 		});
 	}
@@ -304,8 +335,8 @@ export class StubAdapter {
 	async stat(path: string) {
 		const s = await this.raw.stat(path);
 		if (!s || s.type !== "file" || !this.isRemote(path)) return s;
-		const entry = await this.opts.store.get(path);
-		return entry ? { ...s, size: entry.size, mtime: entry.mtime, ctime: entry.ctime } : s;
+		const info = this.index.get(path);
+		return info ? { ...s, ...info } : s;
 	}
 
 	async copy(from: string, to: string): Promise<void> {
@@ -324,25 +355,24 @@ export class StubAdapter {
 		// A folder: move each file of the store under it. Files only on disk move with the folder.
 		const moves: [string, string][] =
 			stat?.type === "folder"
-				? (await this.opts.store.paths())
+				? this.paths()
 						.filter((p) => p.startsWith(`${from}/`))
 						.map((p) => [p, to + p.slice(from.length)])
 				: [[from, to]];
 		const contents = new Map<string, Uint8Array>();
 		for (const [src] of moves) {
-			if (this.isRemote(src) && (await this.opts.store.get(src))) contents.set(src, await this.content(src));
+			if (this.index.has(src)) contents.set(src, await this.content(src));
 		}
 		await this.raw.rename(from, to);
 		for (const [src, dst] of moves) {
 			const plain = contents.get(src);
-			const entry = await this.opts.store.get(src);
+			const entry = this.index.get(src);
 			if (plain === undefined) {
-				// A plaintext file moved into the remote-only folder.
+				// A plaintext file moved to a remote-only path.
 				if (this.isRemote(dst)) await this.convert(dst);
 				continue;
 			}
-			await this.opts.store.delete(src);
-			this.dropResource(src);
+			await this.drop(src);
 			await this.serial(dst, async () => {
 				const times = { mtime: entry?.mtime ?? Date.now(), ctime: entry?.ctime ?? Date.now() };
 				if (this.isRemote(dst)) await this.put(dst, plain, times);
@@ -374,11 +404,8 @@ export class StubAdapter {
 	}
 
 	private async forget(path: string, folder: boolean): Promise<void> {
-		const paths = folder ? (await this.opts.store.paths()).filter((p) => p === path || p.startsWith(`${path}/`)) : [path];
-		for (const p of paths) {
-			await this.opts.store.delete(p);
-			this.dropResource(p);
-		}
+		const paths = folder ? this.paths().filter((p) => p === path || p.startsWith(`${path}/`)) : [path];
+		for (const p of paths) if (this.index.has(p)) await this.drop(p);
 	}
 
 	/**

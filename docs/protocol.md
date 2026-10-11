@@ -29,7 +29,7 @@ plugin's TypeScript types are generated from its OpenAPI schema. Crypto details 
 |---|---|
 | 400 | `bad_request`, `bad_signature_format` |
 | 401 | `unauthenticated`, `token_expired`, `challenge_invalid` |
-| 403 | `forbidden`, `join_required`, `device_pending`, `device_revoked`, `user_disabled`, `vault_disabled` |
+| 403 | `forbidden`, `join_required`, `device_pending`, `device_revoked`, `device_locked`, `remote_only`, `user_disabled`, `vault_disabled` |
 | 404 | `not_found` |
 | 409 | `stale_parent`, `exists`, `keyring_version` |
 | 413 | `too_large` |
@@ -157,6 +157,7 @@ The signature is an sshsig over `message` (UTF-8) with namespace `syncryption-au
 | Key is an active device of this user and vault | ignored | log in, `status: "active"` |
 | Key is a pending device of this user and vault | ignored | log in, `status: "pending"` |
 | Key is a revoked device | ignored | `403 device_revoked` |
+| Key is a locked remote-only device | ignored | `403 device_locked` |
 | Key unknown, the vault exists and is enabled | not needed | add the key as a **pending** device of the vault |
 | Key unknown, the vault exists and is disabled | | `403 vault_disabled` |
 | Key unknown, the vault doesn't exist, another new key is creating it | | `409 vault_being_created` |
@@ -185,7 +186,7 @@ also tells whether such a vault exists.
 
 Response `200`:
 ```json
-{ "token": "<b64u 32 bytes>", "expiresAt": "...", "deviceId": "d_...", "vaultId": "<uuid>", "status": "active", "created": true }
+{ "token": "<b64u 32 bytes>", "expiresAt": "...", "deviceId": "d_...", "vaultId": "<uuid>", "status": "active", "created": true, "remoteOnly": false, "graceSeconds": 86400 }
 ```
 - `created` is true when this request created the user or the device.
 - `vaultId` is the device's vault, or `null` for a creating device.
@@ -194,15 +195,21 @@ Response `200`:
   and the recovery endpoints (section 7.4), and everything else returns
   `403 device_pending`. Status is checked on every request, so the same token gains access
   as soon as it is approved.
-- Tokens are random, stored as `SHA-256(token)`, and expire after 1 hour. The client logs
-  in again on `401 token_expired`.
+- Tokens are random, stored as `SHA-256(token)`, and expire after 1 hour, or 5 minutes for
+  a remote-only device. The client logs in again on `401 token_expired`.
+- `remoteOnly` is the server's copy of the device's keyring policy (section 6).
+  `graceSeconds` is the vault's grace period for remote-only devices: how long one may go
+  without a login before it locks ([remote-only.md](remote-only.md) section 5). The default
+  is 86400 (24 hours); the administrator sets it per vault (section 14).
 
 ## 6. Devices
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/v1/devices/self` | the caller's device, pending tokens allowed |
 | `GET` | `/api/v1/vaults/{id}/devices` | the vault's devices |
-| `POST` | `/api/v1/vaults/{id}/devices/{deviceId}/approve` | pending to active |
+| `POST` | `/api/v1/vaults/{id}/devices/{deviceId}/approve` | pending to active, optional body `{"remoteOnly": true}` |
+| `PUT` | `/api/v1/vaults/{id}/devices/{deviceId}/policy` | `{"remoteOnly": true}` or `false`: change another active device's policy |
+| `PUT` | `/api/v1/vaults/{id}/devices/{deviceId}/lock` | `{"locked": true}` or `false`: lock or unlock another remote-only device |
 | `DELETE` | `/api/v1/vaults/{id}/devices/{deviceId}` | remove (revoke) |
 
 The vault routes need an active device of that vault. `GET .../devices` returns
@@ -222,7 +229,9 @@ device), `vaultName` and `username`.
   "pairingCode": "XXXXX-XXXXX",
   "status": "pending",
   "createdAt": "...",
-  "lastSeenAt": "..."
+  "lastSeenAt": "...",
+  "remoteOnly": false,
+  "locked": false
 }
 ```
 - `status` is `pending`, `active` or `revoked`. A vault has at most 5 pending devices, and
@@ -237,7 +246,25 @@ device), `vaultName` and `username`.
   and rejecting a pending device is removing it. Clients then rotate the vault's keyring
   ([crypto.md](crypto.md) section 8.4). The row stays, so the key can't log in or join
   again (`403 device_revoked`). The last active device of a vault can't be removed
-  (`409 exists`).
+  (`409 exists`). Removing a device wakes the vault's long-polls, so the removed device's
+  wait ends with its `403` at once.
+- **Remote-only devices** ([remote-only.md](remote-only.md)): approving with
+  `{"remoteOnly": true}` makes the device remote-only, and cuts the sessions it already has
+  to 5 minutes. Without a body, or with `false`, it is a full device. The approving client
+  sets the same policy in the keyring, which is what other clients trust. A remote-only
+  device can't manage the vault: approving, removing (itself included), uploading a
+  keyring (`PUT .../keyring`), recovery uploads and the policy and lock calls return
+  `403 remote_only`.
+- **Changing the policy** (`PUT .../policy`) of another active device: the client first
+  uploads a keyring with the new policy, then tells the server. Making a device
+  remote-only cuts its sessions to 5 minutes; making it a full device again clears its
+  lock. A pending or removed device, or the caller itself, returns `400 bad_request`. The
+  change wakes the vault's long-polls, and the device follows its new policy at its next
+  keyring refresh.
+- **Locking** (`PUT .../lock`) a remote-only device ends its sessions and releases its
+  locks; until it is unlocked, its logins and requests return `403 device_locked`. Its
+  remote-only files stay locked, but nothing is deleted. A full device, a pending or
+  removed one, or the caller itself returns `400 bad_request`.
 
 ## 7. Vaults and keyring
 
@@ -457,6 +484,8 @@ deletes the blobs no revision references any more. The values are fixed:
 - Returns as soon as vault `seq > since`, `locksSeq > locksSince` or, if `keyringSince` is
   given, the keyring version `> keyringSince`, or after `timeout` seconds (at most 25)
   with `changed: false`.
+- The session is checked again each time the wait wakes, so a device removed while it
+  waits gets its `403 device_revoked` (or `401`) at once.
 - The client then calls `/changes` or `/locks` as needed and loops.
 - On network errors it backs off exponentially, from 1 s up to 60 s. It also backs off
   when a sync after a wake-up didn't reach `seq`, so a failing sync doesn't spin.
@@ -540,18 +569,23 @@ API. Every route needs `ADMIN_TOKEN`.
   attempt from that IP gets `429`, even with the right token.
 - **Pages:** `GET /admin` shows the login form or the dashboard;
   `POST /admin/{users|vaults}/{id}/{disable|enable|purge}` and
-  `POST /admin/maintenance/{on|off}` (form field `message` for `on`) act and redirect to
+  `POST /admin/maintenance/{on|off}` (form field `message` for `on`) and
+  `POST /admin/vaults/{id}/grace` (form field `hours`, empty for the default) act and redirect to
   `/admin?done=<code>`.
 - **JSON:**
   - `GET /admin/api/status` returns `{"version", "protocol", "maintenance", "adminContact"}`,
     with the same values as `/health`.
   - `GET /admin/api/users` returns `{"users": [...]}`. Each user has `id`, `username`,
     `createdAt`, `lastSeenAt`, `disabled`, `vaults` (`id`, `name`, `size` in stored
-    bytes, `files`, `createdAt`, `lastChangeAt`, `disabled`, and `devices`: `id`, `name`,
-    `fingerprint`, `status`, `createdAt`, `lastSeenAt`) and `creating`
+    bytes, `files`, `createdAt`, `lastChangeAt`, `disabled`, `remoteOnlyGrace` (seconds, or
+    `null` for the default), and `devices`: `id`, `name`, `fingerprint`, `status`,
+    `createdAt`, `lastSeenAt`, `remoteOnly`) and `creating`
     (`[{"vaultName", "device"}]`, keys that haven't created their vault yet). Times are
     RFC 3339 or `null`.
   - `POST /admin/api/{users|vaults}/{id}/{disable|enable}` returns `204`.
+  - `POST /admin/api/vaults/{id}/grace` with `{"graceSeconds": <3600 to 31536000 or null>}`
+    sets the vault's grace period for remote-only devices and returns `204`. Devices get it
+    at their next login.
   - `POST /admin/api/{users|vaults}/{id}/purge` with `{"confirm": "<username or vault
     name>"}` returns `204`. It returns `409 not_disabled` unless the item is disabled
     first, and `400 confirm` if the name doesn't match.

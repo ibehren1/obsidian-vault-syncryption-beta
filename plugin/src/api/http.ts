@@ -42,6 +42,13 @@ export function isRevoked(e: unknown): e is ApiError {
 	return e instanceof ApiError && e.code === "device_revoked";
 }
 
+/** Another device of the vault locked this remote-only device (remote-only.md 5): wait for it to unlock. */
+export function isLocked(e: unknown): e is ApiError {
+	return e instanceof ApiError && e.code === "device_locked";
+}
+
+export const LOCKED_TEXT = "Another device of the vault locked this device. Its notes stay locked until it is unlocked there.";
+
 export const REVOKED_TEXT =
 	"This device's encryption key was removed from the vault. Generate a new key in the settings to pair the device again.";
 

@@ -68,9 +68,9 @@ flowchart LR
   be told apart or revoked separately. Sharing through separate keys under the same
   username (each paired into the vault) avoids that.
 - A device whose key leaks can read everything that device could read. Revocation
-  (section 8) protects data written **after** the revocation. Proposed remote-only
-  devices ([remote-only.md](remote-only.md)) would also make the device's own local copy
-  unreadable after revocation, but not data copied while the device was still a member.
+  (section 8) protects data written **after** the revocation. Remote-only devices
+  ([remote-only.md](remote-only.md)) also make the device's own local copy unreadable
+  after revocation, but not data copied while the device was still a member.
 - A malicious server can deny service or roll the whole vault back to an older state it
   has seen. Clients detect rollback of the keyring (section 6.4). Detecting rollback of
   individual files is out of scope for v1.
@@ -288,6 +288,9 @@ The keyring plaintext is UTF-8 JSON:
 - `recovery` is an optional native age X25519 recipient, `recoverySigner` the Ed25519 key
   derived from the same recovery key, and `recoverySetBy` the device that set it
   (section 9). The three are either all present or all absent.
+- A device entry may have `"policy": "remote-only"` (absent: a full device). A remote-only
+  device keeps only ciphertext on disk ([remote-only.md](remote-only.md)), and reads its own
+  policy from this entry, never from the server. No other value is valid.
 
 ### 6.2 Encryption
 `keyring.age` is a standard age v1 file whose payload is the plaintext above. Its
@@ -332,6 +335,11 @@ On every keyring fetch the client checks:
   new version was signed by a device (not by the recovery signer), and the fields are
   either all absent or `recoverySetBy` is that signing device's `id`. So a recovery key
   can't replace itself, and the device that set it is always known (section 9).
+- the signer isn't a remote-only device (its entry in the authority keyring, the pinned one
+  or, on first use, the keyring itself, has no `policy`). A remote-only device can't manage
+  the vault, so it never signs a keyring.
+- a version signed by the recovery signer changes no existing device's `policy` and adds
+  only devices without one. So only a full device sets, changes or removes a policy.
 
 The client then pins `{version, sha256(keyring.age)}`.
 
@@ -574,10 +582,31 @@ values (nonces, ephemeral keys, salts) as inputs.
 | `ed25519-to-x25519.json` | public and private conversion | libsodium (`pynacl`) |
 | `age-ssh-ed25519.json` | deterministic wraps, malformed and foreign stanzas, files encrypted by rage and Go `age` to known keys; plugin output (files and keyrings) checked by `age -d` in CI | reference script, rage (`pyrage`), Go `age` |
 | `sshsig.json` | signatures in both namespaces, plus wrong-namespace, wrong-hash, wrong-key-type and tampered cases; plugin signatures checked by `ssh-keygen -Y verify` | `ssh-keygen -Y sign`, reference script |
-| `kdf.json` | `indexKey`, `fileId` (including NFC cases), `fileKey`, invalid paths, pairing codes | reference script |
+| `kdf.json` | `indexKey`, `fileId` (including NFC cases), `fileKey`, invalid paths, pairing codes, the local key with sealed content and a sealed hash | reference script |
 | `objects.json` | meta and chunk objects with fixed nonces, and tampered-header cases | reference script |
-| `keyring.json` | a keyring chain (genesis, recovery key set, pairing, rotation, recovery) with the recovery key and its signing key, and rollback, chain-gap, wrong-vault, wrong-signer and inconsistency cases | reference script, rage (`pyrage`) |
+| `keyring.json` | a keyring chain (genesis, recovery key set, pairing, rotation, recovery) with the recovery key and its signing key, remote-only policies, and rollback, chain-gap, wrong-vault, wrong-signer, policy and inconsistency cases | reference script, rage (`pyrage`) |
 
 The reference script is a small Python program (`testvectors/generate.py`) using
 `cryptography`, `bcrypt`, `pynacl` and `pyrage`, independent of the plugin code. The Go `age`
 files need the `age` binary, from `$AGE` or `PATH`.
+
+## 11. Remote-only local key
+A remote-only device ([remote-only.md](remote-only.md)) keeps its notes and attachments on
+disk only as ciphertext, under a key derived from the keyring:
+```
+localKey = HKDF(indexKey, "", "syncryption/v1/local")
+```
+`indexKey` never changes and is only in the keyring, so the device can derive `localKey`
+only while the server hands it the keyring. It lives only in memory. Once the key is
+removed from the vault, the local copy can't be opened.
+
+Everything under it is XChaCha20-Poly1305 with a random 24-byte nonce:
+- **file content** in the local store, with
+  `AD = "syncryption/v1/local-content" || 0x00 || utf8(path)`;
+- **plaintext hashes** in the sync state (`SyncedFile.sha256`), which would otherwise let
+  anyone confirm a guess of a file's content, with
+  `AD = "syncryption/v1/local-hash" || 0x00 || utf8(path)`. The 32-byte hash is stored as
+  `"s1:" || b64u(nonce || ciphertext)`.
+
+The path in the AD stops an entry being moved to another path. `kdf.json` has the key and
+one example of each.
