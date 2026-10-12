@@ -1,13 +1,20 @@
 # vault-syncryption-server
 
-The Vault Syncryption sync server. See [../docs/architecture.md](../docs/architecture.md) and
-[../docs/protocol.md](../docs/protocol.md).
+The Vault Syncryption sync server. See [../docs/architecture.md](../docs/architecture.md),
+[../docs/protocol.md](../docs/protocol.md) and the endpoint reference
+[../docs/api.md](../docs/api.md).
 
 ```
 uv sync
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
+```
+
+`../docs/api.md` is generated from the app's OpenAPI schema. Regenerate it after any change
+to a route or a model, or `tests/test_apidocs.py` fails:
+```
+uv run python -m syncryption_server apidocs > ../docs/api.md
 ```
 
 Run a development server. The app is built by a factory that reads its settings from the
@@ -20,7 +27,8 @@ SHARED_SECRET=dev-secret ADMIN_TOKEN=dev-admin-token-0123456789abcdef BEHIND_PRO
 `SYNCRYPTION_DATA_DIR` is for development only and isn't part of the container
 configuration. S3 is optional: without the `S3_*` variables, blobs are stored under
 `<data dir>/blobs`. `ADMIN_CONTACT` (optional) sets the contact shown on `/`, in `/health`
-and in maintenance and disabled-account errors. The container variables are described in
+and in maintenance and disabled-account errors, and `DISABLE_METRICS=TRUE` turns off
+`/metrics`. The container variables are described in
 [../docs/self-hosting.md](../docs/self-hosting.md), section 2.
 
 Tests run against a temporary directory and, for `S3BlobStore`, an in-process moto

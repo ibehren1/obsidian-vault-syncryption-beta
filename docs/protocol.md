@@ -4,9 +4,13 @@ The FastAPI app in `backend/` implements this document, at protocol version `1`
 (section 13). The plugin's TypeScript types are generated from the app's OpenAPI schema.
 Crypto details live in [crypto.md](crypto.md).
 
+[api.md](api.md) is the endpoint reference, generated from that schema: every path, its
+parameters, its request and response bodies and every field of every model. This document
+explains the flows that reference only lists.
+
 ## 1. Conventions
 - **Base URL:** the configured endpoint, e.g. `https://notes.example.com`. All paths
-  below are under `/api/v1`, except `/`, `/health`, `/admin` and the icons
+  below are under `/api/v1`, except `/`, `/health`, `/metrics`, `/admin` and the icons
   (`/favicon.ico`, `/icon-32.png`, `/icon-128.png`, `/icon-256.png`).
 - **Bodies:** JSON (`application/json`), except blob uploads and downloads, which are
   `application/octet-stream`.
@@ -75,6 +79,13 @@ or maintenance with its start time and message), and a "Health" section with the
 `GET /health` body as pretty-printed JSON (`"status": "unavailable"` included when the
 database or blob store is unreachable). It never shows the shared secret, and it
 works during maintenance.
+
+`GET /metrics` (*public*) returns Prometheus metrics in the text exposition format
+(`text/plain; version=0.0.4`), unless the server sets `DISABLE_METRICS=TRUE`, in which case
+it is `404 not_found`. It holds counts only: no label names a user, vault, device, file or
+path, and requests are labelled with the route template (`/api/v1/vaults/{vault_id}/changes`),
+never the raw path. It works during maintenance. The metric names are listed in
+self-hosting.md 5.1.
 
 ## 3. Model: users, devices, vaults
 The server tracks identity and data separately:

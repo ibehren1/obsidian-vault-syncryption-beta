@@ -3,8 +3,12 @@
  * under the local key (crypto.md 11) in a local store and served through a wrapped
  * `app.vault.adapter`. Sync goes through the Vault API, so it goes through the wrapper too.
  */
-import { concat, fromUtf8, utf8 } from "../crypto/bytes";
-import { openLocal, sealLocal } from "../crypto/local";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { randomBytes } from "@noble/ciphers/utils.js";
+
+import { concat, fromHex, fromUtf8, hex, utf8 } from "../crypto/bytes";
+import { ENTRY_ID_SIZE, openLocal, openLocalChunk, sealLocalChunk } from "../crypto/local";
+import { CHUNK_SIZE } from "../crypto/objects";
 import { MissingContentError } from "../sync/fs";
 
 /** The size and times of a remote-only file, kept next to its sealed content. */
@@ -14,34 +18,96 @@ export interface EntryInfo {
 	ctime: number;
 }
 
-/** One remote-only file in the local store, keyed by its path. */
+/** An entry's info as stored: a chunked entry also names its id (hex). */
+export interface StoredInfo extends EntryInfo {
+	id?: string;
+}
+
+/** A remote-only file from before chunking: the whole content sealed at once. */
 export interface SealedEntry extends EntryInfo {
 	nonce: Uint8Array;
 	data: Uint8Array;
 }
 
+/** A remote-only file whose content is `count` chunks sealed under its random `id`. */
+export interface ChunkedEntry extends EntryInfo {
+	id: Uint8Array;
+	count: number;
+}
+
+export type StoredEntry = SealedEntry | ChunkedEntry;
+
+/** One sealed chunk of a `ChunkedEntry`. */
+export interface SealedPiece {
+	nonce: Uint8Array;
+	data: Uint8Array;
+}
+
 export interface EntryStore {
-	get(path: string): Promise<SealedEntry | undefined>;
-	put(path: string, entry: SealedEntry): Promise<void>;
+	get(path: string): Promise<StoredEntry | undefined>;
+	/** Replace the entry; the previous entry's chunks go in the same step. */
+	put(path: string, entry: StoredEntry): Promise<void>;
+	/** Delete the entry and its chunks. */
 	delete(path: string): Promise<void>;
+	getChunk(id: Uint8Array, index: number): Promise<SealedPiece | undefined>;
+	putChunk(id: Uint8Array, index: number, piece: SealedPiece): Promise<void>;
+	deleteChunks(id: Uint8Array): Promise<void>;
+	/** The ids (hex) that have chunks, to find those of writes that never finished. */
+	chunkIds(): Promise<Set<string>>;
 	/** Every entry's size and times, without the content. */
-	infos(): Promise<Map<string, EntryInfo>>;
+	infos(): Promise<Map<string, StoredInfo>>;
+}
+
+function storedInfo(entry: StoredEntry): StoredInfo {
+	const times: EntryInfo = { size: entry.size, mtime: entry.mtime, ctime: entry.ctime };
+	return "id" in entry ? { ...times, id: hex(entry.id) } : times;
 }
 
 export class MemoryEntryStore implements EntryStore {
-	readonly entries = new Map<string, SealedEntry>();
+	readonly entries = new Map<string, StoredEntry>();
+	readonly chunks = new Map<string, SealedPiece>();
+	private key(id: Uint8Array | string, index: number): string {
+		return `${typeof id === "string" ? id : hex(id)}/${index}`;
+	}
+	private dropChunks(id: string): void {
+		for (const k of [...this.chunks.keys()]) if (k.startsWith(`${id}/`)) this.chunks.delete(k);
+	}
 	async get(path: string) {
 		return this.entries.get(path);
 	}
-	async put(path: string, entry: SealedEntry) {
+	async put(path: string, entry: StoredEntry) {
+		const old = this.entries.get(path);
+		const id = storedInfo(entry).id;
+		if (old && "id" in old && hex(old.id) !== id) this.dropChunks(hex(old.id));
 		this.entries.set(path, entry);
 	}
 	async delete(path: string) {
+		const old = this.entries.get(path);
+		if (old && "id" in old) this.dropChunks(hex(old.id));
 		this.entries.delete(path);
 	}
-	async infos() {
-		return new Map([...this.entries].map(([p, { size, mtime, ctime }]) => [p, { size, mtime, ctime }]));
+	async getChunk(id: Uint8Array, index: number) {
+		return this.chunks.get(this.key(id, index));
 	}
+	async putChunk(id: Uint8Array, index: number, piece: SealedPiece) {
+		this.chunks.set(this.key(id, index), piece);
+	}
+	async deleteChunks(id: Uint8Array) {
+		this.dropChunks(hex(id));
+	}
+	async chunkIds() {
+		return new Set([...this.chunks.keys()].map((k) => k.slice(0, k.indexOf("/"))));
+	}
+	async infos() {
+		return new Map([...this.entries].map(([p, e]) => [p, storedInfo(e)]));
+	}
+}
+
+/** A write whose chunks are in the store but whose entry isn't yet (`stage`). */
+interface Staged {
+	id: Uint8Array;
+	count: number;
+	size: number;
 }
 
 interface WriteOptions {
@@ -112,7 +178,9 @@ export class LockedError extends Error {
 	}
 }
 
+/** The bytes as an `ArrayBuffer`, without a copy when `data` already spans its whole buffer. */
 function buffer(data: Uint8Array): ArrayBuffer {
+	if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) return data.buffer as ArrayBuffer;
 	return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
 }
 
@@ -126,6 +194,8 @@ export interface StubAdapterOptions {
 	onResource?: (path: string) => void;
 	/** `URL.createObjectURL` and `revokeObjectURL`, replaceable in tests. */
 	urls?: { create(blob: Blob): string; revoke(url: string): void };
+	/** The size of the chunks a write is sealed in (default 4 MiB, as on the server). */
+	chunkSize?: number;
 }
 
 export class StubAdapter {
@@ -139,6 +209,8 @@ export class StubAdapter {
 	private readonly urls: { create(blob: Blob): string; revoke(url: string): void };
 	/** Set by `restoreAll`: the files go back on disk for good. */
 	private restoring = false;
+	/** Downloads whose chunks are stored, waiting for their Vault write (`stage`). */
+	private readonly staged = new Map<string, Staged>();
 
 	constructor(private readonly opts: StubAdapterOptions) {
 		this.urls = opts.urls ?? { create: (b) => URL.createObjectURL(b), revoke: (u) => URL.revokeObjectURL(u) };
@@ -163,10 +235,20 @@ export class StubAdapter {
 		return this.opts.isRemote(path.replace(/^\/+/, ""));
 	}
 
-	/** Read the store's index. Call once, before Obsidian reads through the wrapper. */
+	/**
+	 * Read the store's index, and delete the chunks of writes that never finished (a crash
+	 * between the chunks and the entry). Call once, before Obsidian reads through the wrapper.
+	 */
 	async load(): Promise<void> {
 		this.index.clear();
-		for (const [path, info] of await this.opts.store.infos()) this.index.set(path, info);
+		const used = new Set<string>();
+		for (const [path, { size, mtime, ctime, id }] of await this.opts.store.infos()) {
+			this.index.set(path, { size, mtime, ctime });
+			if (id) used.add(id);
+		}
+		for (const id of await this.opts.store.chunkIds()) {
+			if (!used.has(id)) await this.opts.store.deleteChunks(fromHex(id));
+		}
 	}
 
 	/** The paths in the store. */
@@ -225,18 +307,64 @@ export class StubAdapter {
 		return this.key;
 	}
 
-	private seal(path: string, plain: Uint8Array, mtime: number, ctime: number): SealedEntry {
-		const { nonce, data } = sealLocal(this.requireKey(), "local-content", path, plain);
-		return { nonce, data, size: plain.length, mtime, ctime };
+	/**
+	 * Seal `count` chunks into the store under a new entry id, without an entry yet. If the
+	 * chunks don't come to `count`, or `chunks` throws, the ones stored are deleted.
+	 */
+	private async sealChunks(path: string, count: number, chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): Promise<Staged> {
+		const id = randomBytes(ENTRY_ID_SIZE);
+		let index = 0;
+		let size = 0;
+		try {
+			for await (const plain of chunks) {
+				if (index >= count) throw new Error("More chunks than expected.");
+				const piece = sealLocalChunk(this.requireKey(), path, id, index, count, plain);
+				await this.opts.store.putChunk(id, index++, piece);
+				size += plain.length;
+			}
+			if (index !== count) throw new Error("Fewer chunks than expected.");
+		} catch (e) {
+			await this.opts.store.deleteChunks(id);
+			throw e;
+		}
+		return { id, count, size };
 	}
 
-	private open(path: string, entry: SealedEntry): Uint8Array {
-		return openLocal(this.requireKey(), "local-content", path, entry.nonce, entry.data);
-	}
-
-	private async store(path: string, entry: SealedEntry): Promise<void> {
+	private async commit(path: string, staged: Staged, mtime: number, ctime: number): Promise<void> {
+		const entry: ChunkedEntry = { id: staged.id, count: staged.count, size: staged.size, mtime, ctime };
 		await this.opts.store.put(path, entry);
-		this.index.set(path, { size: entry.size, mtime: entry.mtime, ctime: entry.ctime });
+		this.index.set(path, { size: entry.size, mtime, ctime });
+	}
+
+	/** The plaintext chunks of a stored entry, one at a time. */
+	private async *chunksOf(path: string, entry: StoredEntry): AsyncGenerator<Uint8Array> {
+		if (!("id" in entry)) {
+			yield openLocal(this.requireKey(), "local-content", path, entry.nonce, entry.data);
+			return;
+		}
+		let size = 0;
+		for (let i = 0; i < entry.count; i++) {
+			const piece = await this.opts.store.getChunk(entry.id, i);
+			// Lost chunks: the content is missing, and the sync downloads the file again.
+			if (!piece) throw new MissingContentError();
+			const plain = openLocalChunk(this.requireKey(), path, entry.id, i, entry.count, piece.nonce, piece.data);
+			size += plain.length;
+			yield plain;
+		}
+		if (size !== entry.size) throw new MissingContentError();
+	}
+
+	/** The whole plaintext of an entry, in one buffer of its exact size. */
+	private async open(path: string, entry: StoredEntry): Promise<Uint8Array> {
+		if (!("id" in entry)) return openLocal(this.requireKey(), "local-content", path, entry.nonce, entry.data);
+		const out = new Uint8Array(entry.size);
+		let offset = 0;
+		for await (const plain of this.chunksOf(path, entry)) {
+			if (offset + plain.length > out.length) throw new MissingContentError();
+			out.set(plain, offset);
+			offset += plain.length;
+		}
+		return out;
 	}
 
 	private async drop(path: string): Promise<void> {
@@ -259,12 +387,73 @@ export class StubAdapter {
 		return plain;
 	}
 
+	/** The plaintext of a remote-only file in chunks, so a large one is never whole in memory. */
+	private async *contentChunks(path: string): AsyncGenerator<Uint8Array> {
+		this.requireKey();
+		const entry = await this.opts.store.get(path);
+		if (entry) {
+			yield* this.chunksOf(path, entry);
+			return;
+		}
+		yield await this.content(path);
+	}
+
+	/** The hex SHA-256 of a remote-only file, read one chunk at a time. */
+	async hash(path: string): Promise<string> {
+		return this.serial(path, async () => {
+			const h = sha256.create();
+			for await (const plain of this.contentChunks(path)) h.update(plain);
+			return hex(h.digest());
+		});
+	}
+
+	/**
+	 * Store a file that arrives in `count` chunks (a download), one chunk at a time. Its entry
+	 * is written by the next empty `writeBinary` of `path`, through the Vault API, so Obsidian
+	 * sees the change. If `chunks` throws (a chunk or the file hash failed its check), nothing
+	 * is kept.
+	 */
+	async stage(path: string, count: number, chunks: AsyncIterable<Uint8Array>): Promise<void> {
+		const staged = await this.sealChunks(path, count, chunks);
+		const old = this.staged.get(path);
+		if (old) await this.opts.store.deleteChunks(old.id);
+		this.staged.set(path, staged);
+	}
+
+	/** Commits a staged write that no Vault write committed. Returns whether there was one. */
+	async commitStaged(path: string, times: WriteOptions): Promise<boolean> {
+		return this.serial(path, async () => {
+			if (!this.staged.has(path)) return false;
+			await this.put(path, new Uint8Array(0), times);
+			return true;
+		});
+	}
+
+	/** Drops a staged write that won't be committed (the Vault write failed). */
+	async unstage(path: string): Promise<void> {
+		const staged = this.staged.get(path);
+		this.staged.delete(path);
+		if (staged) await this.opts.store.deleteChunks(staged.id);
+	}
+
 	/** Stores the content and leaves an empty stub with the file's times, so Obsidian sees a change. */
 	private async put(path: string, plain: Uint8Array, options?: WriteOptions): Promise<void> {
 		const prev = this.index.get(path);
 		const mtime = options?.mtime ?? Date.now();
 		const ctime = prev?.ctime ?? options?.ctime ?? mtime;
-		await this.store(path, this.seal(path, plain, mtime, ctime));
+		const staged = this.staged.get(path);
+		this.staged.delete(path);
+		if (staged && plain.length === 0) {
+			await this.commit(path, staged, mtime, ctime);
+		} else {
+			if (staged) await this.opts.store.deleteChunks(staged.id);
+			const size = this.opts.chunkSize ?? CHUNK_SIZE;
+			const count = Math.ceil(plain.length / size);
+			const pieces = function* () {
+				for (let off = 0; off < plain.length; off += size) yield plain.subarray(off, off + size);
+			};
+			await this.commit(path, await this.sealChunks(path, count, pieces()), mtime, ctime);
+		}
 		this.dropResource(path);
 		await this.raw.writeBinary(path, EMPTY, { ...options, mtime, ctime });
 	}
@@ -299,7 +488,8 @@ export class StubAdapter {
 				this.index.delete(path);
 				return false;
 			}
-			await this.raw.writeBinary(path, buffer(this.open(path, entry)), { mtime: entry.mtime, ctime: entry.ctime });
+			const plain = await this.open(path, entry);
+			await this.raw.writeBinary(path, buffer(plain), { mtime: entry.mtime, ctime: entry.ctime });
 			await this.drop(path);
 			return true;
 		});
@@ -461,11 +651,16 @@ export class StubAdapter {
 		if (this.locked || this.resources.has(path) || this.warming.has(path)) return false;
 		this.warming.add(path);
 		try {
-			const plain = await this.serial(path, () => this.content(path));
+			// Chunk by chunk into the Blob, so a large attachment is never one buffer here.
+			const parts = await this.serial(path, async () => {
+				const out: ArrayBuffer[] = [];
+				for await (const plain of this.contentChunks(path)) out.push(buffer(plain));
+				return out;
+			});
 			if (this.locked) return false;
 			const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
 			const type = MIME[ext] ?? "application/octet-stream";
-			this.resources.set(path, this.urls.create(new Blob([buffer(plain)], { type })));
+			this.resources.set(path, this.urls.create(new Blob(parts, { type })));
 			return true;
 		} catch {
 			return false;

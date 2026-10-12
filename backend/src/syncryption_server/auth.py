@@ -174,6 +174,9 @@ async def challenge(
     request: Request,
     state: Annotated[AppState, Depends(get_state)],
 ) -> ChallengeResponse:
+    """Start a login: the message the device signs with its encryption key. It is issued for
+    any well-formed key, username and vault name, is single use and expires after 60 s. The
+    client checks every line of the message before it signs (protocol.md 5.1)."""
     if not USERNAME_RE.match(body.username):
         raise bad_request("Usernames are 1 to 32 characters: a-z, 0-9, '.', '_' or '-'.")
     try:
@@ -233,6 +236,7 @@ def _secret_ok(state: AppState, ip: str, secret: str | None) -> bool:
     expected = state.settings.shared_secret.encode()
     if hmac.compare_digest(secret.encode(), expected):
         return True
+    state.metrics.shared_secret_failures.inc()
     with state.db.transaction() as db:
         db.execute("INSERT INTO join_attempts (ip, at) VALUES (?, ?)", (ip, now))
     if everyone + 1 >= total:
@@ -273,6 +277,9 @@ async def verify(
     request: Request,
     state: Annotated[AppState, Depends(get_state)],
 ) -> VerifyResponse:
+    """Finish a login with the signature over the challenge, and return a session token. A
+    key the server doesn't know joins here: as a pending device when the vault exists, or
+    with the shared secret as the device that creates it (protocol.md 5.2)."""
     ip = limit_key(client_ip(request, state))
     limit_auth(state, ip)
     return await state.db.run(lambda: _verify(body, ip, state))

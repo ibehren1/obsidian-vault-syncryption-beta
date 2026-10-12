@@ -150,6 +150,9 @@ export class RemoteOnly {
 		stub.unlock(key);
 		this.key = key;
 		this.api = session.api;
+		// The store is this device's only copy: ask the browser not to evict it under storage
+		// pressure. It may refuse, which changes nothing else.
+		void navigator.storage?.persist?.().catch(() => false);
 		this.setFlag({ vaultId });
 		await store.sealAll(key);
 		// Only a full device's empty files are empty notes. Later, an empty file without its
