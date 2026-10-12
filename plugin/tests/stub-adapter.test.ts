@@ -4,7 +4,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 
 import { hex } from "../src/crypto/bytes";
 import { sealLocal } from "../src/crypto/local";
-import { LockedError, MemoryEntryStore, StubAdapter, type WrappedAdapter } from "../src/remote/stub-adapter";
+import { LockedError, MemoryEntryStore, replaceStubUrl, StubAdapter, type WrappedAdapter } from "../src/remote/stub-adapter";
 import { isMissingContent } from "../src/sync/fs";
 import { FakeDisk } from "./fake-disk";
 
@@ -329,5 +329,22 @@ describe("StubAdapter chunks", () => {
 		const { stub, adapter } = setup(CHUNK);
 		await adapter.writeBinary("R/video.mp4", bytes(BIG).buffer as ArrayBuffer);
 		expect(await stub.warm("R/video.mp4")).toBe(true);
+	});
+});
+
+describe("replaceStubUrl", () => {
+	function element(src: string | null) {
+		const attrs = new Map<string, string>();
+		if (src !== null) attrs.set("src", src);
+		return { getAttribute: (n: string) => attrs.get(n) ?? null, setAttribute: (n: string, v: string) => void attrs.set(n, v), attrs };
+	}
+
+	it("points elements still showing the stub's URL, with Obsidian's ?mtime, at the decrypted one", () => {
+		const shown = element("app://disk/R/pic.png?1700000000000");
+		const other = element("app://disk/R/other.png?1");
+		const none = element(null);
+		expect(replaceStubUrl([shown, other, none], "app://disk/R/pic.png", "blob:7")).toBe(1);
+		expect(shown.attrs.get("src")).toBe("blob:7");
+		expect(other.attrs.get("src")).toBe("app://disk/R/other.png?1");
 	});
 });

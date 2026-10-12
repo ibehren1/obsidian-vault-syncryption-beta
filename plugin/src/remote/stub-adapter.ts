@@ -172,6 +172,31 @@ const MIME: Record<string, string> = {
 	mov: "video/quicktime",
 };
 
+/** The part of a DOM element `replaceStubUrl` needs, so it can be tested without a DOM. */
+export interface UrlElement {
+	getAttribute(name: string): string | null;
+	setAttribute(name: string, value: string): void;
+}
+
+/**
+ * Point the elements that still show a resource's stub URL (Obsidian adds `?<mtime>`) at its
+ * decrypted URL. Live Preview keeps the image it rendered and doesn't ask again, so this is
+ * how an image decrypted after it was rendered appears there. Returns how many it changed.
+ */
+export function replaceStubUrl(elements: Iterable<UrlElement>, stubUrl: string, url: string): number {
+	const base = (s: string) => s.split("?")[0];
+	const stub = base(stubUrl);
+	let changed = 0;
+	for (const el of elements) {
+		const src = el.getAttribute("src");
+		if (src !== null && base(src) === stub) {
+			el.setAttribute("src", url);
+			changed++;
+		}
+	}
+	return changed;
+}
+
 export class LockedError extends Error {
 	constructor() {
 		super("The remote-only files are locked.");
@@ -652,6 +677,16 @@ export class StubAdapter {
 		this.asked.add(path);
 		void this.warm(path);
 		return this.raw.getResourcePath(path);
+	}
+
+	/** The URL a view gets for a resource that isn't decrypted yet: the stub's. */
+	stubUrl(path: string): string {
+		return this.raw.getResourcePath(path);
+	}
+
+	/** The decrypted resource's `blob:` URL, once it is ready. */
+	resourceUrl(path: string): string | undefined {
+		return this.resources.get(path);
 	}
 
 	/**

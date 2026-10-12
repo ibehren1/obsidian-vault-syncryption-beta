@@ -17,7 +17,7 @@ import type { HashMode, SealedHashStore } from "../store/sealed";
 import { isHiddenPath } from "../sync/adapter-fs";
 import type { VaultSession } from "../sync/session";
 import { complianceReport, type ComplianceReport, type RemoteOnlyFlag } from "./compliance";
-import { StubAdapter } from "./stub-adapter";
+import { replaceStubUrl, StubAdapter } from "./stub-adapter";
 
 /** Local storage: this device is remote-only for this vault (`RemoteOnlyFlag`). */
 const FLAG = "syncryption-remote-only";
@@ -288,12 +288,22 @@ export class RemoteOnly {
 		}
 	}
 
-	/** A resource was decrypted after it was first asked for: render the views showing it again. */
+	/**
+	 * A resource was decrypted after it was first asked for: show it where the stub's URL was
+	 * rendered. Reading view renders again; Live Preview keeps its rendered embeds, so their
+	 * elements get the new URL directly.
+	 */
 	private rerender(path: string): void {
+		const stub = this.stub;
+		const url = stub?.resourceUrl(path);
 		const file = this.app.vault.getFileByPath(path);
 		if (file) this.app.vault.trigger("modify", file);
 		this.app.workspace.iterateAllLeaves((leaf) => {
-			if (leaf.view instanceof MarkdownView && leaf.view.getMode() === "preview") leaf.view.previewMode.rerender(true);
+			if (leaf.view instanceof MarkdownView && leaf.view.getMode() === "preview") {
+				leaf.view.previewMode.rerender(true);
+			} else if (stub && url) {
+				replaceStubUrl(Array.from(leaf.view.containerEl.querySelectorAll("img, video, audio")), stub.stubUrl(path), url);
+			}
 		});
 	}
 }

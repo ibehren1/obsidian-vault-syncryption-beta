@@ -225,9 +225,11 @@ For every note and attachment:
   `trashLocal` and `getResourcePath`. For images, PDFs, audio and video,
   `getResourcePath` returns a `blob:` URL. It is synchronous, so a resource not decrypted
   yet gets the stub's URL and is decrypted in the background (the embeds of an opened note
-  are started first). Every view that got the stub's URL is asked to render again once
-  the resource is ready, including when it was already being decrypted and when the sync
-  only brings the file later. A resource decrypted from content that was written over
+  are started first). Every view that got the stub's URL is shown the resource once it is
+  ready, including when it was already being decrypted and when the sync only brings the
+  file later: reading view renders again, and in Live Preview, which keeps the embeds it
+  rendered, the image, video and audio elements still showing the stub's URL get the
+  `blob:` URL directly. A resource decrypted from content that was written over
   meanwhile is dropped.
 - Writes go only to the store. The stub stays empty.
 - Paths in `configDir` go to the real adapter unchanged.
