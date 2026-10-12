@@ -203,7 +203,12 @@ export class StubAdapter {
 	private orig: WrappedAdapter | null = null;
 	private readonly queues = new Map<string, Promise<unknown>>();
 	private readonly resources = new Map<string, string>();
-	private readonly warming = new Set<string>();
+	/** Resources being decrypted, so every caller waits for the same one. */
+	private readonly warming = new Map<string, Promise<boolean>>();
+	/** Resources a view was given the stub's URL for: it is asked to render again once ready. */
+	private readonly asked = new Set<string>();
+	/** Counts the writes of each path, so a resource decrypted before a write isn't kept. */
+	private readonly writes = new Map<string, number>();
 	/** The store's entries without their content, loaded by `load`. */
 	private readonly index = new Map<string, EntryInfo>();
 	private readonly urls: { create(blob: Blob): string; revoke(url: string): void };
@@ -456,6 +461,8 @@ export class StubAdapter {
 		}
 		this.dropResource(path);
 		await this.raw.writeBinary(path, EMPTY, { ...options, mtime, ctime });
+		// A view that asked for it before it was here (or before this write) renders it now.
+		if (this.asked.has(path)) void this.warm(path);
 	}
 
 	/** The size of the file on disk, which is 0 for a stub. */
@@ -640,16 +647,29 @@ export class StubAdapter {
 		if (!this.isRemote(path)) return this.raw.getResourcePath(path);
 		const url = this.resources.get(path);
 		if (url) return url;
-		void this.warm(path).then((ready) => {
-			if (ready) this.opts.onResource?.(path);
-		});
+		// Also when it is already being decrypted (for the note that was opened): the view is
+		// asked to render again once it is ready, or once the sync brings the file.
+		this.asked.add(path);
+		void this.warm(path);
 		return this.raw.getResourcePath(path);
 	}
 
-	/** Decrypts a resource into a `blob:` URL ahead of `getResourcePath`. */
-	async warm(path: string): Promise<boolean> {
-		if (this.locked || this.resources.has(path) || this.warming.has(path)) return false;
-		this.warming.add(path);
+	/**
+	 * Decrypts a resource into a `blob:` URL ahead of `getResourcePath`. Resolves to whether
+	 * it is ready; callers while it is being decrypted share the same promise.
+	 */
+	warm(path: string): Promise<boolean> {
+		if (this.locked) return Promise.resolve(false);
+		if (this.resources.has(path)) return Promise.resolve(true);
+		const pending = this.warming.get(path);
+		if (pending) return pending;
+		const job = this.decryptResource(path).finally(() => this.warming.delete(path));
+		this.warming.set(path, job);
+		return job;
+	}
+
+	private async decryptResource(path: string): Promise<boolean> {
+		const writes = this.writes.get(path) ?? 0;
 		try {
 			// Chunk by chunk into the Blob, so a large attachment is never one buffer here.
 			const parts = await this.serial(path, async () => {
@@ -657,21 +677,23 @@ export class StubAdapter {
 				for await (const plain of this.contentChunks(path)) out.push(buffer(plain));
 				return out;
 			});
-			if (this.locked) return false;
+			// Locked meanwhile, or written again: this content is no longer the file's.
+			if (this.locked || (this.writes.get(path) ?? 0) !== writes) return false;
 			const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
 			const type = MIME[ext] ?? "application/octet-stream";
 			this.resources.set(path, this.urls.create(new Blob(parts, { type })));
-			return true;
 		} catch {
+			// Not in the store yet (still to be downloaded), or locked: tried again at its write.
 			return false;
-		} finally {
-			this.warming.delete(path);
 		}
+		if (this.asked.delete(path)) this.opts.onResource?.(path);
+		return true;
 	}
 
 	private dropResource(path: string): void {
 		const url = this.resources.get(path);
 		if (url) this.urls.revoke(url);
 		this.resources.delete(path);
+		this.writes.set(path, (this.writes.get(path) ?? 0) + 1);
 	}
 }

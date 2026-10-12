@@ -223,7 +223,12 @@ For every note and attachment:
   store. It wraps `read`, `readBinary`, `write`, `writeBinary`, `append`, `appendBinary`,
   `process`, `stat` (the real size and times), `copy`, `rename`, `remove`, `trashSystem`,
   `trashLocal` and `getResourcePath`. For images, PDFs, audio and video,
-  `getResourcePath` returns a `blob:` URL.
+  `getResourcePath` returns a `blob:` URL. It is synchronous, so a resource not decrypted
+  yet gets the stub's URL and is decrypted in the background (the embeds of an opened note
+  are started first). Every view that got the stub's URL is asked to render again once
+  the resource is ready, including when it was already being decrypted and when the sync
+  only brings the file later. A resource decrypted from content that was written over
+  meanwhile is dropped.
 - Writes go only to the store. The stub stays empty.
 - Paths in `configDir` go to the real adapter unchanged.
 - After the plugin loads, it makes Obsidian index the files again, because the startup

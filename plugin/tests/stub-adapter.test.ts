@@ -185,6 +185,40 @@ describe("StubAdapter", () => {
 		expect(adapter.getResourcePath("plain.png")).toBe("app://disk/plain.png");
 	});
 
+	it("renders a resource asked for while it is already being decrypted", async () => {
+		const { stub, adapter, ready } = setup();
+		await adapter.writeBinary("R/pic.png", new Uint8Array([1, 2, 3]).buffer);
+		// The opened note's embeds are decrypted first, and the view renders meanwhile.
+		const warming = stub.warm("R/pic.png");
+		expect(adapter.getResourcePath("R/pic.png")).toBe("app://disk/R/pic.png");
+		expect(await warming).toBe(true);
+		expect(ready).toEqual(["R/pic.png"]);
+		expect(adapter.getResourcePath("R/pic.png")).toBe("blob:0");
+	});
+
+	it("renders a resource asked for before the sync brought it, once it is written", async () => {
+		const { adapter, disk, ready } = setup();
+		disk.put("R/pic.png", "", 1000); // a stub whose content isn't downloaded yet
+		expect(adapter.getResourcePath("R/pic.png")).toBe("app://disk/R/pic.png");
+		await new Promise((r) => setTimeout(r, 0));
+		expect(ready).toEqual([]);
+		await adapter.writeBinary("R/pic.png", new Uint8Array([1, 2, 3]).buffer);
+		await new Promise((r) => setTimeout(r, 0));
+		expect(ready).toEqual(["R/pic.png"]);
+		expect(adapter.getResourcePath("R/pic.png")).toBe("blob:0");
+	});
+
+	it("doesn't keep a resource decrypted before the file was written again", async () => {
+		const { stub, adapter, created, revoked } = setup();
+		await adapter.writeBinary("R/pic.png", new Uint8Array([1]).buffer);
+		const warming = stub.warm("R/pic.png");
+		await adapter.writeBinary("R/pic.png", new Uint8Array([2]).buffer);
+		await warming;
+		// Whichever finished first, no URL of the old content is still served.
+		expect(created.filter((u) => !revoked.includes(u))).toEqual([]);
+		expect(adapter.getResourcePath("R/pic.png")).toBe("app://disk/R/pic.png");
+	});
+
 	it("loads the index from the store and reports the real sizes", async () => {
 		const { store, adapter } = setup();
 		await adapter.write("R/a.md", "hello");
