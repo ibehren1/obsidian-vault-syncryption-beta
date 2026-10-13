@@ -2,13 +2,16 @@
 
 Everything needs `ADMIN_TOKEN`: as `Authorization: Bearer <token>`, or entered once in the
 login form, which starts a browser session (an HttpOnly cookie, plus a CSRF token in every
-form). The page lists users, their vaults with stored sizes, and each vault's devices (one
-encryption key each). Users and vaults can be disabled (no access, data kept), enabled
-again, and purged once disabled. Purging a vault also deletes its devices. Each vault has a
-grace period for its remote-only devices (remote-only.md 5).
-Maintenance mode pauses the whole sync API until it is turned off (protocol.md 14.1).
+form). The Vaults tab lists users, their vaults with stored sizes, and under each vault its
+devices (one encryption key each). Users and vaults can be disabled (no access, data kept),
+enabled again, and purged once disabled. Purging a vault also deletes its devices. Each vault
+has a grace period for its remote-only devices (remote-only.md 5) and an optional storage
+quota (protocol.md 12).
+Maintenance mode pauses the whole sync API until it is turned off (protocol.md 14.1). The
+Performance tab polls the server's metrics and shows them as rates (protocol.md 14.2).
 """
 
+import base64
 import hashlib
 import hmac
 import html
@@ -16,14 +19,15 @@ import logging
 import secrets
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from syncryption_server import PROTOCOL_VERSION, __version__
+from syncryption_server import PROTOCOL_VERSION, __version__, metrics
 from syncryption_server.auth import REMOTE_ONLY_GRACE, client_ip, limit_key, request_origin
 from syncryption_server.config import MAX_NOTE, note_problem
 from syncryption_server.encoding import rfc3339
@@ -45,10 +49,18 @@ Action = Literal["disable", "enable", "purge"]
 
 router = APIRouter(prefix="/admin", include_in_schema=False)
 
+PERFORMANCE_JS = (Path(__file__).parent / "static" / "admin-performance.js").read_bytes()
+# The Performance tab's choices, in seconds; 0 pauses.
+INTERVALS = (1, 2, 5, 10, 30, 60, 0)
+DEFAULT_INTERVAL = 5
+
 
 # remote-only.md 5: the grace period of a vault's remote-only devices, in seconds.
 MIN_GRACE = 3600
 MAX_GRACE = 365 * 24 * 3600
+# protocol.md 12: a vault's storage quota in bytes; the form takes whole GB (2**30 bytes).
+GB = 1024**3
+MAX_QUOTA = 2**50
 
 
 class AdminError(Exception):
@@ -75,6 +87,9 @@ MESSAGES = {
     "grace_set": "Grace period saved. Remote-only devices get it at their next login.",
     "bad_grace": f"The grace period is a whole number of hours from 1 to {MAX_GRACE // 3600}, "
     f"or empty for the default ({REMOTE_ONLY_GRACE // 3600} hours).",
+    "quota_set": "Storage quota saved. It applies to the next upload.",
+    "bad_quota": f"The quota is a whole number of GB from 1 to {MAX_QUOTA // GB}, "
+    "or empty for no quota.",
 }
 # Codes that aren't errors, shown in green.
 SUCCESS = (
@@ -85,6 +100,7 @@ SUCCESS = (
     "maintenance_on",
     "maintenance_off",
     "grace_set",
+    "quota_set",
 )
 
 
@@ -157,7 +173,7 @@ def overview(state: AppState) -> list[dict]:
     users = state.db.all("SELECT * FROM users ORDER BY username")
     vaults = state.db.all(
         "SELECT v.id, v.user_id, v.name, v.created_at, v.disabled_at, v.remote_only_grace, "
-        "(SELECT COALESCE(SUM(size), 0) FROM blobs b WHERE b.vault_id = v.id) AS size, "
+        "v.blob_bytes AS size, v.blob_quota, "
         "(SELECT COUNT(*) FROM files f JOIN revisions r ON r.vault_id = f.vault_id "
         "AND r.rev = f.head_rev WHERE f.vault_id = v.id AND r.deleted = 0) AS files, "
         "(SELECT COUNT(*) FROM revisions r WHERE r.vault_id = v.id) AS revisions, "
@@ -204,6 +220,8 @@ def overview(state: AppState) -> list[dict]:
                         "disabled": v["disabled_at"] is not None,
                         # null: the default, REMOTE_ONLY_GRACE
                         "remoteOnlyGrace": v["remote_only_grace"],
+                        # null: no quota
+                        "quota": v["blob_quota"],
                         "devices": [device(d) for d in mine if d["vault_id"] == v["id"]],
                     }
                     for v in vaults
@@ -329,6 +347,21 @@ async def set_grace(state: AppState, vault_id: str, seconds: int | None) -> str:
     return "grace_set"
 
 
+async def set_quota(state: AppState, vault_id: str, quota: int | None) -> str:
+    """Set a vault's storage quota in bytes, None for no quota."""
+    if quota is not None and not 1 <= quota <= MAX_QUOTA:
+        raise AdminError("bad_quota")
+    row = await state.db.read(lambda: _row(state, "vaults", vault_id))
+
+    def store() -> None:
+        with state.db.transaction() as db:
+            db.execute("UPDATE vaults SET blob_quota = ? WHERE id = ?", (quota, vault_id))
+
+    await state.db.run(store)
+    log.info("admin: set the storage quota of vault %s/%s", row["username"], row["name"])
+    return "quota_set"
+
+
 async def set_maintenance(state: AppState, on: bool, message: str | None = None) -> str:
     """Turn maintenance on (or update its message) or off. Returns the message code."""
     if not on:
@@ -388,6 +421,11 @@ class MaintenanceRequest(BaseModel):
     message: str | None = Field(None, max_length=MAX_NOTE, description="Shown to users.")
 
 
+@router.get("/api/performance")
+async def api_performance(admin: ApiAdmin, state: State) -> dict:
+    return await metrics.snapshot(state)
+
+
 @router.get("/api/status")
 async def api_status(admin: ApiAdmin, state: State) -> dict:
     return status(state)
@@ -417,6 +455,23 @@ class GraceRequest(BaseModel):
 async def api_grace(vault_id: str, body: GraceRequest, admin: ApiAdmin, state: State) -> Response:
     try:
         await set_grace(state, vault_id, body.graceSeconds)
+    except AdminError as e:
+        if e.status == 404:
+            raise not_found() from e
+        raise bad_request(MESSAGES[e.code]) from e
+    return Response(status_code=204)
+
+
+class QuotaRequest(BaseModel):
+    quotaBytes: int | None = Field(
+        description=f"1 to {MAX_QUOTA} bytes of stored blobs, or null for no quota."
+    )
+
+
+@router.post("/api/vaults/{vault_id}/quota", status_code=204)
+async def api_quota(vault_id: str, body: QuotaRequest, admin: ApiAdmin, state: State) -> Response:
+    try:
+        await set_quota(state, vault_id, body.quotaBytes)
     except AdminError as e:
         if e.status == 404:
             raise not_found() from e
@@ -455,8 +510,14 @@ body {
 }
 h1 { font-size: 1.4rem; }
 h2 { font-size: 1.1rem; margin: 0; }
-section { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
-section.disabled { background: #f6f0f0; }
+section {
+  border: 1px solid #d3ddcf;
+  border-radius: 6px;
+  padding: 1rem;
+  margin: 1rem 0;
+  background: #f5f8f3;
+}
+section.disabled { background: #f8f1f1; border-color: #e3caca; }
 table { border-collapse: collapse; width: 100%; margin: .5rem 0; }
 th, td {
   text-align: left;
@@ -464,7 +525,7 @@ th, td {
   border-bottom: 1px solid #eee;
   vertical-align: top;
 }
-td.num { text-align: right; }
+td.num, th.num { text-align: right; }
 pre { background: #f6f6f6; border: 1px solid #ddd; border-radius: 6px; padding: .75rem; }
 .muted { color: #777; }
 .tag { font-size: .8rem; padding: 0 .4rem; border-radius: 4px; background: #c33; color: #fff; }
@@ -482,7 +543,49 @@ header { display: flex; justify-content: space-between; align-items: center; }
 .brand { display: flex; align-items: center; gap: 1rem; }
 .brand h1 { margin: .5rem 0; }
 .brand .ver { color: #777; font-size: .95rem; font-weight: 400; }
+.top { display: flex; align-items: center; gap: 1rem; }
+nav.tabs { display: flex; gap: .25rem; }
+nav.tabs a {
+  padding: .25rem .75rem;
+  border: 1px solid #2d2f31;
+  border-radius: 6px;
+  color: #2d2f31;
+  text-decoration: none;
+}
+nav.tabs a.on { background: #2d2f31; color: #fff; }
+h3 { font-size: 1rem; margin: 0; }
+section.vault {
+  margin: .75rem 0 0;
+  padding: .75rem;
+  background: #fff;
+  border-left: 4px solid #9fb89a;
+}
+section.vault.disabled { background: #fbf5f5; border-color: #e3caca; border-left-color: #d49a9a; }
+section.vault.creating { background: #fffcf4; border-left-color: #e2c27a; }
+section.vault th { border-bottom: 2px solid #9fb89a; }
+/* The Performance tab's cards, in the logo's colour. */
+section.stripe { background: #fff; border-color: #d5d7d9; border-left: 4px solid #2d2f31; }
+section.stripe th { border-bottom: 2px solid #2d2f31; }
+section.vault p { margin: .25rem 0; }
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin: 1rem 0;
+}
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); gap: 0 1rem; }
+.stats { display: flex; flex-wrap: wrap; gap: .5rem 2rem; margin: .5rem 0; }
+.stat .label { color: #777; margin-right: .5rem; }
+.spark { display: inline-block; vertical-align: middle; margin-left: .5rem; }
+.spark svg { display: block; }
+section.stripe td:first-child { width: 100%; }
+section.stripe td.num { white-space: nowrap; }
+td.trend { padding-top: .35rem; }
+td.trend .spark { margin: 0; }
 """
+# The CSP allows this one stylesheet by its hash, so no other inline style can apply.
+STYLE_HASH = "sha256-" + base64.b64encode(hashlib.sha256(STYLE.encode()).digest()).decode()
 
 
 def _size(n: int) -> str:
@@ -514,8 +617,14 @@ def brand(title: str, version: str | None = None) -> str:
     )
 
 
-def html_page(body: str, status: int = 200, title: str = "Vault Syncryption admin") -> HTMLResponse:
-    """A page with the admin style and strict headers. Also used for the `/` page."""
+def html_page(
+    body: str, status: int = 200, title: str = "Vault Syncryption admin", script: str | None = None
+) -> HTMLResponse:
+    """A page with the admin style and strict headers. Also used for the `/` page. Pages run
+    no scripts, except `script`, a same-origin path, which may then fetch from this origin."""
+    if script is not None:
+        body += f'<script src="{html.escape(script)}"></script>'
+    scripts = "script-src 'self'; connect-src 'self'; " if script is not None else ""
     doc = (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -527,8 +636,8 @@ def html_page(body: str, status: int = 200, title: str = "Vault Syncryption admi
         status_code=status,
         headers={
             "Cache-Control": "no-store",
-            "Content-Security-Policy": "default-src 'none'; img-src 'self'; "
-            "style-src 'unsafe-inline'; "
+            "Content-Security-Policy": f"default-src 'none'; img-src 'self'; {scripts}"
+            f"style-src '{STYLE_HASH}'; "
             "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
             "Referrer-Policy": "no-referrer",
             "X-Frame-Options": "DENY",
@@ -589,6 +698,23 @@ def _grace_form(admin: Admin, vault: dict) -> str:
     )
 
 
+def _quota_form(admin: Admin, vault: dict) -> str:
+    """The vault's storage quota in whole GB; empty means no quota."""
+    quota = vault["quota"]
+    # A quota set through the API in bytes shows rounded up to whole GB.
+    value = str(-(-quota // GB)) if quota is not None else ""
+    csrf = (
+        f'<input type="hidden" name="csrf" value="{html.escape(admin.csrf)}">' if admin.csrf else ""
+    )
+    target = f"/admin/vaults/{html.escape(vault['id'])}/quota"
+    return (
+        f'<form class="inline" method="post" action="{target}">{csrf}'
+        f'<input name="gb" size="6" inputmode="numeric" value="{value}" '
+        'placeholder="none" aria-label="Storage quota in GB"> GB '
+        "<button>Save</button></form>"
+    )
+
+
 def _maintenance_section(admin: Admin, state: AppState) -> str:
     csrf = f'<input type="hidden" name="csrf" value="{html.escape(admin.csrf or "")}">'
     m = state.maintenance
@@ -611,10 +737,8 @@ def _maintenance_section(admin: Admin, state: AppState) -> str:
     )
 
 
-def _dashboard(
-    admin: Admin, state: AppState, users: list[dict], message: str | None, error: bool
-) -> HTMLResponse:
-    total = sum(v["size"] for u in users for v in u["vaults"])
+def _header(admin: Admin, tab: str) -> str:
+    """The logo, the tabs and the logout button."""
     logout = (
         '<form method="post" action="/admin/logout">'
         f'<input type="hidden" name="csrf" value="{html.escape(admin.csrf)}">'
@@ -622,7 +746,60 @@ def _dashboard(
         if admin.csrf
         else ""
     )
-    parts = [f"<header>{brand('Vault Syncryption admin')}{logout}</header>"]
+    links = "".join(
+        f'<a href="{href}"{' class="on"' if name == tab else ""}>{label}</a>'
+        for name, label, href in (
+            ("vaults", "Vaults", "/admin"),
+            ("performance", "Performance", "/admin?tab=performance"),
+        )
+    )
+    return (
+        f"<header>{brand('Vault Syncryption admin', __version__)}"
+        f'<div class="top"><nav class="tabs">{links}</nav>{logout}</div></header>'
+    )
+
+
+def _keys(devices: list[dict]) -> str:
+    """A vault's encryption keys, one device each."""
+    if not devices:
+        return '<p class="muted">No keys.</p>'
+    rows = [
+        "<table><tr><th>Device</th><th>Key</th><th>Status</th>"
+        "<th>Joined</th><th>Last seen</th></tr>"
+    ]
+    for d in devices:
+        rows.append(
+            f"<tr><td>{html.escape(d['name'])}</td>"
+            f'<td class="muted">{html.escape(d["fingerprint"])}</td>'
+            f"<td>{html.escape(d['status'])}"
+            f"{' <span class="muted">remote-only</span>' if d['remoteOnly'] else ''}"
+            f"{' <span class="muted">locked</span>' if d['locked'] else ''}</td>"
+            f"<td>{_when(d['createdAt'])}</td><td>{_when(d['lastSeenAt'])}</td></tr>"
+        )
+    rows.append("</table>")
+    return "".join(rows)
+
+
+def _vault_card(admin: Admin, v: dict) -> str:
+    tag = ' <span class="tag">disabled</span>' if v["disabled"] else ""
+    return (
+        f'<section class="vault{" disabled" if v["disabled"] else ""}">'
+        f"<header><h3>{html.escape(v['name'])}{tag}</h3>"
+        f"<div>{_actions(admin, 'vaults', v, v['name'])}</div></header>"
+        f'<p class="muted">{_size(v["size"])} stored · {v["files"]:,} files · '
+        f"{v['revisions']:,} versions · created {_when(v['createdAt'])} · "
+        f"last change {_when(v['lastChangeAt'])}</p>"
+        f"<div>Remote-only grace {_grace_form(admin, v)}</div>"
+        f"<div>Storage quota {_quota_form(admin, v)}</div>"
+        f"{_keys(v['devices'])}</section>"
+    )
+
+
+def _dashboard(
+    admin: Admin, state: AppState, users: list[dict], message: str | None, error: bool
+) -> HTMLResponse:
+    total = sum(v["size"] for u in users for v in u["vaults"])
+    parts = [_header(admin, "vaults")]
     if message:
         parts.append(f'<p class="notice{" error" if error else ""}">{html.escape(message)}</p>')
     parts.append(_maintenance_section(admin, state))
@@ -646,46 +823,133 @@ def _dashboard(
             f'<p class="muted">Joined {_when(u["createdAt"])}. '
             f"Last seen {_when(u['lastSeenAt'])}.</p>"
         )
-        if u["vaults"]:
-            parts.append(
-                "<table><tr><th>Vault</th><th>Stored</th><th>Files</th><th>Versions</th>"
-                "<th>Created</th>"
-                "<th>Last change</th><th>Remote-only grace</th><th></th></tr>"
-            )
-            for v in u["vaults"]:
-                vtag = ' <span class="tag">disabled</span>' if v["disabled"] else ""
-                parts.append(
-                    f"<tr><td>{html.escape(v['name'])}{vtag}</td>"
-                    f'<td class="num">{_size(v["size"])}</td><td class="num">{v["files"]}</td>'
-                    f'<td class="num">{v["revisions"]}</td>'
-                    f"<td>{_when(v['createdAt'])}</td><td>{_when(v['lastChangeAt'])}</td>"
-                    f"<td>{_grace_form(admin, v)}</td>"
-                    f"<td>{_actions(admin, 'vaults', v, v['name'])}</td></tr>"
-                )
-            parts.append("</table>")
-        else:
+        if not u["vaults"] and not u["creating"]:
             parts.append('<p class="muted">No vaults.</p>')
-        rows = [(v["name"], d) for v in u["vaults"] for d in v["devices"]]
-        rows += [(f"{c['vaultName']} (being created)", c["device"]) for c in u["creating"]]
-        if rows:
+        parts.extend(_vault_card(admin, v) for v in u["vaults"])
+        # Keys that registered to create a vault: one card per vault name.
+        creating: dict[str, list[dict]] = {}
+        for c in u["creating"]:
+            creating.setdefault(c["vaultName"], []).append(c["device"])
+        for vault_name, devices in creating.items():
             parts.append(
-                "<table><tr><th>Device</th><th>Vault</th><th>Key</th><th>Status</th>"
-                "<th>Joined</th><th>Last seen</th></tr>"
+                f'<section class="vault creating"><header><h3>{html.escape(vault_name)} '
+                '<span class="muted">(being created)</span></h3></header>'
+                f"{_keys(devices)}</section>"
             )
-            for vault, d in rows:
-                parts.append(
-                    f"<tr><td>{html.escape(d['name'])}</td><td>{html.escape(vault)}</td>"
-                    f'<td class="muted">{html.escape(d["fingerprint"])}</td>'
-                    f"<td>{html.escape(d['status'])}"
-                    f"{' <span class="muted">remote-only</span>' if d['remoteOnly'] else ''}"
-                    f"{' <span class="muted">locked</span>' if d['locked'] else ''}</td>"
-                    f"<td>{_when(d['createdAt'])}</td><td>{_when(d['lastSeenAt'])}</td></tr>"
-                )
-            parts.append("</table>")
         parts.append("</section>")
     if not users:
         parts.append('<p class="muted">No users yet.</p>')
     return html_page("".join(parts))
+
+
+def _spark(value_id: str) -> str:
+    """Where the script draws the value's recent trend."""
+    return f'<span class="spark" id="spark-{value_id}"></span>'
+
+
+def _stat(label: str, value_id: str, spark: bool = False) -> str:
+    trend = _spark(value_id) if spark else ""
+    return (
+        f'<span class="stat"><span class="label">{label}</span><b id="{value_id}">–</b>'
+        f"{trend}</span>"
+    )
+
+
+def _line(label: str, value_id: str, row_id: str | None = None, spark: bool = False) -> str:
+    row = f' id="{row_id}" hidden' if row_id else ""
+    trend = _spark(value_id) if spark else ""
+    return (
+        f'<tr{row}><td>{label}</td><td class="trend">{trend}</td>'
+        f'<td class="num" id="{value_id}">–</td></tr>'
+    )
+
+
+def _card(title: str, rows: str) -> str:
+    return f'<section class="stripe"><h2>{title}</h2><table>{rows}</table></section>'
+
+
+def _performance(admin: Admin) -> HTMLResponse:
+    """The Performance tab. The numbers are filled in by admin-performance.js."""
+    options = "".join(
+        f'<option value="{s}"{" selected" if s == DEFAULT_INTERVAL else ""}>'
+        f"{f'{s} s' if s else 'Paused'}</option>"
+        for s in INTERVALS
+    )
+    requests = (
+        '<section class="stripe"><h2>Requests <span class="muted">(last interval)</span></h2>'
+        '<div class="stats">'
+        + _stat("Requests/s", "rps", spark=True)
+        + _stat("Errors/s (5xx)", "e5", spark=True)
+        + _stat("4xx/s", "e4", spark=True)
+        + '</div><div class="stats">'
+        + _stat("Latency p50", "p50")
+        + _stat("p95", "p95", spark=True)
+        + _stat("p99", "p99")
+        + '<span class="muted">(excludes /wait long-polls)</span></div>'
+        '<table><thead><tr><th>Route</th><th class="num">Req/s</th><th class="num">p95</th>'
+        '</tr></thead><tbody id="routes"></tbody></table></section>'
+    )
+    sync = _card(
+        'Sync activity <span class="muted">(per second)</span>',
+        _line("File commits", "commits", spark=True)
+        + _line("Conflicts (409)", "conflicts", spark=True)
+        + _line("Blob uploads", "uploads", spark=True)
+        + _line("Blob downloads", "downloads", spark=True)
+        + _line("Logins", "logins", spark=True)
+        + _line("Unauthenticated (401)", "s401", spark=True)
+        + _line("Rate limited (429)", "s429", spark=True),
+    )
+    load = _card(
+        "Traffic and load",
+        _line("Received", "bin", spark=True)
+        + _line("Sent", "bout", spark=True)
+        + _line("In flight (without long-polls)", "inflight", spark=True)
+        + _line("Open long-polls", "longpolls", spark=True)
+        + _line("Event-loop lag (worst of 10 s)", "lag", spark=True),
+    )
+    server = _card(
+        "Server",
+        _line("CPU (process)", "cpu", spark=True)
+        + _line("CPU (container)", "ccpu", "row-ccpu", spark=True)
+        + _line("Memory (process)", "mem", spark=True)
+        + _line("Memory (container)", "cmem", "row-cmem", spark=True)
+        + _line("Open files", "fds")
+        + _line("Active locks", "locks")
+        + _line("Maintenance", "maintenance")
+        + _line("Wrong admin tokens / shared secrets", "failures"),
+    )
+    disk = _card(
+        "Disk and database",
+        _line("Free on the data disk", "disk", "row-disk")
+        + _line("meta.db", "db", "row-db")
+        + _line("Write-ahead log", "wal", "row-wal")
+        + _line("Cleanup runs (retention/blobs)", "gc")
+        + _line("Last cleanup", "gclast")
+        + _line("Revisions removed by retention", "pruned")
+        + _line("Blobs deleted by cleanup", "deleted"),
+    )
+    storage = _card(
+        "Storage",
+        _line("Users", "users")
+        + _line("Vaults", "vaults")
+        + _line("Keys", "keys")
+        + _line("Files", "files")
+        + _line("Versions", "revisions")
+        + _line("Blobs", "blobs")
+        + _line("Stored", "stored", spark=True),
+    )
+    body = (
+        _header(admin, "performance") + '<div class="toolbar"><label>Refresh every '
+        f'<select id="interval">{options}</select></label>'
+        '<span class="muted" id="updated">Loading…</span></div>'
+        '<noscript><p class="notice error">The Performance tab needs JavaScript. The same '
+        "numbers are in GET /admin/api/performance.</p></noscript>"
+        + requests
+        + f'<div class="cols">{sync}{load}</div>'
+        + f'<div class="cols">{server}{disk}</div>'
+        + storage
+    )
+    return html_page(body, script="/admin/performance.js")
 
 
 async def _form(request: Request) -> dict[str, str]:
@@ -698,16 +962,36 @@ def _back(code: str) -> RedirectResponse:
 
 
 @router.get("")
-async def page(request: Request, state: State, done: str = "") -> Response:
+async def page(request: Request, state: State, done: str = "", tab: str = "") -> Response:
     admin = await _admin(request, state)
     if admin is None:
         if done == "logged_out":
             return _login_page(MESSAGES[done], error=False)
         return _login_page(status=401 if _bearer(request) else 200)
+    if tab == "performance":
+        return _performance(admin)
     message = MESSAGES.get(done)
     error = done not in SUCCESS
     users = await state.db.read(lambda: overview(state))
     return _dashboard(admin, state, users, message, error)
+
+
+@router.get("/performance.json")
+async def performance_json(request: Request, state: State) -> Response:
+    """The Performance tab's data, with the session cookie (a GET changes nothing, so no CSRF)."""
+    if await _admin(request, state) is None:
+        raise ApiError(401, "unauthenticated", "Log in first.")
+    return JSONResponse(await metrics.snapshot(state), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/performance.js")
+async def performance_js() -> Response:
+    """The Performance tab's script. Static, so it needs no login."""
+    return Response(
+        PERFORMANCE_JS,
+        media_type="text/javascript",
+        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @router.post("/login")
@@ -735,10 +1019,19 @@ async def login(request: Request, state: State) -> Response:
         max_age=SESSION_TTL,
         path="/admin",
         httponly=True,
-        secure=request_origin(request, state).startswith("https:"),
+        secure=_secure_cookie(request_origin(request, state)),
         samesite="strict",
     )
     return response
+
+
+def _secure_cookie(origin: str) -> bool:
+    """`Secure` always, except for plain HTTP to this machine (development), where a browser
+    wouldn't send the cookie back. Not from the scheme alone: a request that claims `http`
+    must not get a cookie that may travel unencrypted."""
+    host = (urlsplit(origin).hostname or "").lower()
+    loopback = host == "localhost" or host == "::1" or host.startswith("127.")
+    return not (origin.startswith("http:") and loopback)
 
 
 async def _form_admin(request: Request, state: AppState, form: dict[str, str]) -> Admin | None:
@@ -796,6 +1089,21 @@ async def form_grace(vault_id: str, request: Request, state: State) -> Response:
         if hours and not hours.isdigit():
             raise AdminError("bad_grace")
         code = await set_grace(state, vault_id, int(hours) * 3600 if hours else None)
+    except AdminError as e:
+        code = e.code
+    return _back(code)
+
+
+@router.post("/vaults/{vault_id}/quota")
+async def form_quota(vault_id: str, request: Request, state: State) -> Response:
+    form = await _form(request)
+    try:
+        if await _form_admin(request, state, form) is None:
+            return _login_page("Log in first.", status=401)
+        gb = form.get("gb", "").strip()
+        if gb and (not gb.isdigit() or len(gb) > 9):
+            raise AdminError("bad_quota")
+        code = await set_quota(state, vault_id, int(gb) * GB if gb else None)
     except AdminError as e:
         code = e.code
     return _back(code)

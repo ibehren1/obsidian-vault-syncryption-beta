@@ -5,6 +5,7 @@ import contextlib
 import html
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,7 +31,12 @@ from syncryption_server import (
 from syncryption_server.config import Settings, load_settings
 from syncryption_server.db import Database, OldDataError
 from syncryption_server.encoding import rfc3339
-from syncryption_server.errors import error_response, install_error_handlers, too_large
+from syncryption_server.errors import (
+    error_response,
+    forbidden,
+    install_error_handlers,
+    too_large,
+)
 from syncryption_server.openapi import install_openapi
 from syncryption_server.state import AppState, load_maintenance
 from syncryption_server.storage import BlobStore, LocalBlobStore, S3BlobStore
@@ -170,34 +176,50 @@ def home_page(state: AppState, origin: str, health: dict[str, object]) -> HTMLRe
 
 
 def make_blob_store(settings: Settings) -> BlobStore:
-    if settings.s3 is not None:
-        return S3BlobStore(settings.s3)
+    if settings.blob_s3 is not None:
+        return S3BlobStore(settings.blob_s3)
     return LocalBlobStore(settings.data_dir)
 
 
 async def _gc_loop(state: AppState) -> None:
-    m = state.metrics
     while True:
         await asyncio.sleep(GC_INTERVAL)
-        m.gc_runs.labels("retention").inc()
-        try:
-            pruned = await retention.prune(state)
-            m.pruned.inc(pruned)
-            if pruned:
-                log.info("retention pruned %d old revisions", pruned)
-        except Exception:
-            m.gc_failures.labels("retention").inc()
-            log.exception("history retention failed")
-        m.gc_runs.labels("blobs").inc()
-        try:
-            # Blobs a prune freed are usually older than GC_GRACE, so they go in this pass.
-            deleted = await blobs.collect_garbage(state)
-            m.gc_deleted.inc(deleted)
-            if deleted:
-                log.info("garbage collection deleted %d unreferenced blobs", deleted)
-        except Exception:
-            m.gc_failures.labels("blobs").inc()
-            log.exception("blob garbage collection failed")
+        await gc_pass(state)
+
+
+async def gc_pass(state: AppState) -> None:
+    """One hourly cleanup: expired challenges, sessions and pending keys, then old
+    revisions, then unreferenced blobs. A failing task doesn't stop the others."""
+    m = state.metrics
+    m.gc_runs.labels("expired").inc()
+    try:
+        # Also done at each login and key listing, but challenge-only traffic does neither.
+        await state.db.run(lambda: auth.sweep_expired(state))
+    except Exception:
+        m.gc_failures.labels("expired").inc()
+        log.exception("sweeping expired logins failed")
+    m.gc_last_run.labels("expired").set(time.time())
+    m.gc_runs.labels("retention").inc()
+    try:
+        pruned = await retention.prune(state)
+        m.pruned.inc(pruned)
+        if pruned:
+            log.info("retention pruned %d old revisions", pruned)
+    except Exception:
+        m.gc_failures.labels("retention").inc()
+        log.exception("history retention failed")
+    m.gc_last_run.labels("retention").set(time.time())
+    m.gc_runs.labels("blobs").inc()
+    try:
+        # Blobs a prune freed are usually older than GC_GRACE, so they go in this pass.
+        deleted = await blobs.collect_garbage(state)
+        m.gc_deleted.inc(deleted)
+        if deleted:
+            log.info("garbage collection deleted %d unreferenced blobs", deleted)
+    except Exception:
+        m.gc_failures.labels("blobs").inc()
+        log.exception("blob garbage collection failed")
+    m.gc_last_run.labels("blobs").set(time.time())
 
 
 def create_app(
@@ -207,7 +229,7 @@ def create_app(
 ) -> FastAPI:
     """Build the app. With no arguments, settings come from the environment."""
     settings = settings or load_settings()
-    app_metrics = metrics.Metrics()
+    app_metrics = metrics.Metrics(settings.data_dir)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -226,13 +248,18 @@ def create_app(
         if clock is not None:
             state.clock = clock
         app.state.ctx = state
-        gc = asyncio.create_task(_gc_loop(state))
+        tasks = [
+            asyncio.create_task(_gc_loop(state)),
+            asyncio.create_task(metrics.watch_loop_lag(app_metrics)),
+        ]
         try:
             yield
         finally:
-            gc.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await gc
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             await blob_store.close()
             await asyncio.to_thread(db.close)
 
@@ -257,9 +284,9 @@ def create_app(
         response.headers[PROTOCOL_HEADER] = str(PROTOCOL_VERSION)
         return response
 
-    if not settings.disable_metrics:
-        # Added last, so it is outermost and counts the maintenance 503 and the 413 too.
-        app.add_middleware(metrics.RequestMetrics, metrics=app_metrics)
+    # Added last, so it is outermost and counts the maintenance 503 and the 413 too. Also with
+    # DISABLE_METRICS, which removes only `/metrics`: the admin page shows the same numbers.
+    app.add_middleware(metrics.RequestMetrics, metrics=app_metrics)
 
     @app.get("/health")
     async def health(request: Request) -> JSONResponse:
@@ -277,12 +304,19 @@ def create_app(
             responses={200: {"content": {CONTENT_TYPE_PLAIN_0_0_4: {}}}},
         )
         async def prometheus(request: Request) -> Response:
-            """Prometheus metrics in the text exposition format. Needs no token. Only counts:
-            requests by route template and status, users, vaults, keys by status, files,
-            revisions, blobs and their bytes, active locks, open long-polls, cleanup runs,
-            wrong shared secrets and admin tokens, and process metrics. No label names a
-            user, vault, device or path. `DISABLE_METRICS=TRUE` removes the endpoint (`404`)."""
-            body = await metrics.render(request.app.state.ctx)
+            """Prometheus metrics in the text exposition format. Needs no token, but answers
+            only clients in `METRICS_ALLOWED_IPS` (empty: loopback and private ranges); others
+            get `403 forbidden`. Only counts: requests by route template and status, users,
+            vaults, keys by status, files, revisions, blobs and their bytes, active locks,
+            open long-polls, cleanup runs, wrong shared secrets and admin tokens, and process
+            metrics. No label names a user, vault, device or path. `DISABLE_METRICS=TRUE`
+            removes the endpoint (`404`)."""
+            state: AppState = request.app.state.ctx
+            if not auth.ip_in(auth.client_ip(request, state), state.settings.metrics_allowed):
+                return error_response(
+                    forbidden("/metrics answers only the addresses in METRICS_ALLOWED_IPS.")
+                )
+            body = await metrics.render(state)
             return Response(body, media_type=CONTENT_TYPE_PLAIN_0_0_4)
 
     def add_icon_route(path: str, media_type: str) -> None:

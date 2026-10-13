@@ -47,7 +47,8 @@ services:
     environment:
       BEHIND_PROXY: "TRUE"
       URL: ""
-      SHARED_SECRET: "dev-secret"
+      # At least 16 characters, as in production.
+      SHARED_SECRET: "dev-shared-secret"
       ADMIN_TOKEN: "dev-admin-token-0123456789abcdef"
       ADMIN_CONTACT: "dev@example.com"
       S3_BUCKET: "syncryption"
@@ -55,3 +56,4 @@ services:
       S3_SECRET_KEY: "minioadmin"
       S3_ENDPOINT: "http://minio:9000"
       MIGRATE_TO_S3: "FALSE"
+      MIGRATE_FROM_S3: "FALSE"
