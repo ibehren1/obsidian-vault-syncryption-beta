@@ -1,0 +1,46 @@
+# XcodeGen spec for the app (and later the FSKit extension). Generate with `xcodegen` in
+# client-macos/; the .xcodeproj is not checked in.
+name: VaultSyncryption
+options:
+  bundleIdPrefix: com.behrenshome.syncryption
+  deploymentTarget:
+    macOS: "26.0"
+packages:
+  SyncryptionClient:
+    path: .
+settings:
+  base:
+    MARKETING_VERSION: "0.1.10"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "6.0"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+targets:
+  VaultSyncryption:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/SyncryptionApp
+      - App/Assets.xcassets
+    dependencies:
+      - package: SyncryptionClient
+        product: SyncryptionAPI
+      - package: SyncryptionClient
+        product: SyncryptionAppCore
+      - package: SyncryptionClient
+        product: SyncryptionCrypto
+      - package: SyncryptionClient
+        product: SyncryptionSync
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Vault Syncryption
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSUIElement: true
+        LSMinimumSystemVersion: "26.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.behrenshome.syncryption.mac
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: YES

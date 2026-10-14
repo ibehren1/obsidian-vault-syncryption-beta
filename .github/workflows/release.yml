@@ -1,6 +1,7 @@
 # Runs on the public GitHub repo only (Gitea uses .gitea/workflows). When main carries a
 # plugin version that has no release yet, build the plugin and publish the release that
-# Obsidian and BRAT install from: tag = version, with main.js, manifest.json and styles.css.
+# Obsidian and BRAT install from: tag = version, with main.js, manifest.json and styles.css,
+# each with a GitHub build provenance attestation (`gh attestation verify`).
 name: Release
 
 on:
@@ -10,6 +11,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -31,25 +34,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: Check the root manifest and versions match the plugin's
         if: steps.version.outputs.new == 'true'
-        run: cmp manifest.json plugin/manifest.json && cmp versions.json plugin/versions.json
+        run: cmp manifest.json client-obsidian-plugin/manifest.json && cmp versions.json client-obsidian-plugin/versions.json
       - uses: actions/setup-node@v4
         if: steps.version.outputs.new == 'true'
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: plugin/package-lock.json
+          cache-dependency-path: client-obsidian-plugin/package-lock.json
       - name: Build
         if: steps.version.outputs.new == 'true'
-        working-directory: plugin
+        working-directory: client-obsidian-plugin
         run: |
           npm ci
           npm run lint
           npm run build
+      - name: Attest the build provenance
+        if: steps.version.outputs.new == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            client-obsidian-plugin/main.js
+            client-obsidian-plugin/manifest.json
+            client-obsidian-plugin/styles.css
       - name: Publish the release
         if: steps.version.outputs.new == 'true'
         run: |
           gh release create "${{ steps.version.outputs.version }}" \
-            plugin/main.js plugin/manifest.json plugin/styles.css \
+            client-obsidian-plugin/main.js client-obsidian-plugin/manifest.json client-obsidian-plugin/styles.css \
             --title "${{ steps.version.outputs.version }}" \
             --target "$GITHUB_SHA" \
             --generate-notes

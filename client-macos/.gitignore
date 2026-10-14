@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+VaultSyncryption.xcodeproj/
+App/Info.plist

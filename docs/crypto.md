@@ -554,7 +554,7 @@ keyring keeps every epoch (6.4): a VDK is 32 bytes, and once the old ciphertext 
 opens nothing on the server.
 
 The epochs and the chain checks are tested with `keyring.json`, and the revocation flow and
-background re-encryption against the real backend (`plugin/tests/revocation.test.ts`).
+background re-encryption against the real backend (`client-obsidian-plugin/tests/revocation.test.ts`).
 
 ## 9. Recovery key
 - Optional. A full device connected to a vault without one offers to create it once, and
