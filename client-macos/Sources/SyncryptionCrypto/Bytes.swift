@@ -73,9 +73,35 @@ private func isBase64Char(_ c: UInt8) -> Bool {
     (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39) || c == 0x2b || c == 0x2f
 }
 
+// Expressions here are written with explicit types: older Swift compilers (6.2, as on the CI
+// runner) give up type-checking long chains of operators on integer and array literals.
+
 /// `u32be(n)`.
 public func u32be(_ n: UInt32) -> Bytes {
-    [UInt8(n >> 24), UInt8(n >> 16 & 0xff), UInt8(n >> 8 & 0xff), UInt8(n & 0xff)]
+    var out = Bytes(repeating: 0, count: 4)
+    for i in 0..<4 {
+        let shift = UInt32(24 - 8 * i)
+        out[i] = UInt8(truncatingIfNeeded: n >> shift)
+    }
+    return out
+}
+
+/// The big-endian u32 at `offset` in `b`.
+public func readU32be(_ b: Bytes, at offset: Int) -> UInt32 {
+    var n: UInt32 = 0
+    for i in 0..<4 {
+        let byte = UInt32(b[offset + i])
+        n = (n << 8) | byte
+    }
+    return n
+}
+
+/// The parts joined into one byte array.
+public func concat(_ parts: Bytes...) -> Bytes {
+    var out = Bytes()
+    out.reserveCapacity(parts.reduce(0) { $0 + $1.count })
+    for p in parts { out.append(contentsOf: p) }
+    return out
 }
 
 /// SSH wire `string`: u32be(length) || bytes.
@@ -127,7 +153,7 @@ struct SshReader {
 
     mutating func u32() throws -> UInt32 {
         let b = try bytes(4)
-        return UInt32(b[0]) << 24 | UInt32(b[1]) << 16 | UInt32(b[2]) << 8 | UInt32(b[3])
+        return readU32be(b, at: 0)
     }
 
     mutating func string() throws -> Bytes { try bytes(Int(try u32())) }

@@ -53,6 +53,20 @@ extension FolderController {
         public let inKeyring: Bool
         /// When it was added to the keyring.
         public let added: String?
+
+        /// The server's view of the key, for its dot.
+        public var serverKind: FolderController.Kind {
+            switch status {
+            case "active": locked ? .warn : .ok
+            case "pending": .warn
+            default: .off
+            }
+        }
+
+        public var serverLabel: String {
+            if status == "active" { return locked ? "Locked" : "Active" }
+            return status.capitalized
+        }
     }
 
     /// Every key of the vault, revoked ones last.

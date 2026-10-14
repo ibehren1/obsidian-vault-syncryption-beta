@@ -17,7 +17,7 @@ public enum Objects {
     public static func metaDomain(_ fileId: Bytes) -> Bytes { Bytes(utf8: "syncryption/v1/meta") + fileId }
 
     public static func chunkDomain(_ fileId: Bytes, _ index: Int) -> Bytes {
-        Bytes(utf8: "syncryption/v1/chunk") + fileId + u32be(UInt32(index))
+        concat(Bytes(utf8: "syncryption/v1/chunk"), fileId, u32be(UInt32(index)))
     }
 
     private static func header(_ epoch: Int) -> Bytes {
@@ -37,7 +37,7 @@ public enum Objects {
     /// The epoch in an object's header, so the reader can pick the right VDK.
     public static func epoch(of object: Bytes) throws(Failure) -> Int {
         guard object.count >= overhead, object[0] == formatVersion else { throw Failure("unsupported or truncated object") }
-        return Int(UInt32(object[1]) << 24 | UInt32(object[2]) << 16 | UInt32(object[3]) << 8 | UInt32(object[4]))
+        return Int(readU32be(object, at: 1))
     }
 
     public static func open(fileKey: Bytes, domain: Bytes, _ object: Bytes) throws(Failure) -> Bytes {

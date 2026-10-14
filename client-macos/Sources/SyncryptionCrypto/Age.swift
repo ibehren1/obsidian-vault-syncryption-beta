@@ -162,8 +162,15 @@ public enum Age {
         return out
     }
 
+    /// The STREAM nonce: an 11-byte big-endian counter, then 1 for the last chunk.
     private static func streamNonce(_ counter: UInt64, last: Bool) -> Bytes {
-        [0, 0, 0] + (0..<8).map { UInt8(counter >> (8 * (7 - $0)) & 0xff) } + [last ? 1 : 0]
+        var nonce = Bytes(repeating: 0, count: 12)
+        for i in 0..<8 {
+            let shift = UInt64(56 - 8 * i)
+            nonce[3 + i] = UInt8(truncatingIfNeeded: counter >> shift)
+        }
+        if last { nonce[11] = 1 }
+        return nonce
     }
 
     /// Decrypt with the first identity that opens a stanza.

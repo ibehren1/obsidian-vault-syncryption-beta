@@ -195,10 +195,17 @@ struct MenuRowStyle: ButtonStyle {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
-                .foregroundStyle(hover && enabled ? Color.white : enabled ? Color.primary : Color.secondary)
-                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(hover && enabled ? Color.accentColor : .clear))
+                .foregroundStyle(textColor)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(fill))
                 .contentShape(Rectangle())
                 .onHover { hover = $0 }
         }
+
+        private var textColor: Color {
+            if !enabled { return .secondary }
+            return hover ? .white : .primary
+        }
+
+        private var fill: Color { hover && enabled ? .accentColor : .clear }
     }
 }

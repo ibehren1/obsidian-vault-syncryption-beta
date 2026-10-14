@@ -64,8 +64,7 @@ struct MenuView: View {
                 Text(summary).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
-            StatePill(text: model.hasProblem ? "Attention" : model.isSyncing ? "Syncing" : model.folders.isEmpty ? "Idle" : "Synced",
-                      kind: model.hasProblem ? .warn : model.isSyncing ? .busy : model.folders.isEmpty ? .off : .ok)
+            StatePill(text: model.overallName, kind: model.overallKind)
         }
     }
 
@@ -74,8 +73,9 @@ struct MenuView: View {
         if n == 0 { return "No folders" }
         let attention = model.folders.filter { [.warn, .error].contains($0.statusKind) || !$0.pendingApprovals.isEmpty }.count
         let files = model.folders.reduce(0) { $0 + $1.fileCount }
-        return attention > 0 ? "\(plural(attention, "folder")) need\(attention == 1 ? "s" : "") attention"
-            : "\(plural(n, "folder")) · \(plural(files, "file"))"
+        if attention == 1 { return "1 folder needs attention" }
+        if attention > 1 { return "\(attention) folders need attention" }
+        return "\(plural(n, "folder")) · \(plural(files, "file"))"
     }
 
     private func item(_ title: String, _ symbol: String, shortcut: KeyEquivalent? = nil, action: @escaping () -> Void) -> some View {

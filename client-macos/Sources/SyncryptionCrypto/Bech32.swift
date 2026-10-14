@@ -17,7 +17,9 @@ enum Bech32 {
     }
 
     private static func hrpExpand(_ hrp: [UInt8]) -> [UInt8] {
-        hrp.map { $0 >> 5 } + [0] + hrp.map { $0 & 31 }
+        let high: [UInt8] = hrp.map { $0 >> 5 }
+        let low: [UInt8] = hrp.map { $0 & 31 }
+        return concat(high, [0], low)
     }
 
     private static func convert(_ data: [UInt8], from: Int, to: Int, pad: Bool) -> [UInt8]? {
@@ -45,9 +47,16 @@ enum Bech32 {
     static func encode(hrp: String, _ data: Bytes) -> String {
         let h = Array(hrp.lowercased().utf8)
         let values = convert(data, from: 8, to: 5, pad: true)!
-        let mod = polymod(hrpExpand(h) + values + [0, 0, 0, 0, 0, 0]) ^ 1
-        let checksum = (0..<6).map { UInt8(mod >> (5 * (5 - $0)) & 31) }
-        return String(decoding: h + [UInt8(ascii: "1")] + (values + checksum).map { charset[Int($0)] }, as: UTF8.self)
+        let zeros = [UInt8](repeating: 0, count: 6)
+        let mod: UInt32 = polymod(concat(hrpExpand(h), values, zeros)) ^ 1
+        var checksum = [UInt8](repeating: 0, count: 6)
+        for i in 0..<6 {
+            let shift = UInt32(5 * (5 - i))
+            checksum[i] = UInt8(truncatingIfNeeded: (mod >> shift) & 31)
+        }
+        let data: [UInt8] = concat(values, checksum).map { charset[Int($0)] }
+        let separator: [UInt8] = [UInt8(ascii: "1")]
+        return String(decoding: concat(h, separator, data), as: UTF8.self)
     }
 
     /// Decode bech32 of either case (not mixed). Returns the lowercase hrp and the data.
@@ -62,7 +71,7 @@ enum Bech32 {
             guard let i = charset.firstIndex(of: c) else { return nil }
             values.append(UInt8(i))
         }
-        guard polymod(hrpExpand(hrp) + values) == 1 else { return nil }
+        guard polymod(concat(hrpExpand(hrp), values)) == 1 else { return nil }
         guard let data = convert(Array(values.dropLast(6)), from: 5, to: 8, pad: false) else { return nil }
         return (String(decoding: hrp, as: UTF8.self), data)
     }

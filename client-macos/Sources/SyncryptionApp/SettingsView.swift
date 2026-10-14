@@ -256,8 +256,8 @@ struct DevicesTab: View {
                                     if k.remoteOnly { Tag(text: "Remote-only", color: .purple) }
                                 }
                                 HStack(spacing: 6) {
-                                    StatusDot(kind: k.status == "active" ? (k.locked ? .warn : .ok) : k.status == "pending" ? .warn : .off, size: 7)
-                                    Text(k.status == "active" ? (k.locked ? "Locked" : "Active") : k.status.capitalized)
+                                    StatusDot(kind: k.serverKind, size: 7)
+                                    Text(k.serverLabel)
                                 }
                                 Fingerprint(value: k.fingerprint)
                                 Text(k.pairingCode).font(.callout.monospaced()).foregroundStyle(.secondary)

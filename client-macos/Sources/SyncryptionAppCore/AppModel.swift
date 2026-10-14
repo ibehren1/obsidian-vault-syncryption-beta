@@ -57,6 +57,19 @@ public final class AppModel {
         }
     }
 
+    /// The state of all folders together, for the menu's header.
+    public var overallName: String {
+        if hasProblem { return "Attention" }
+        if isSyncing { return "Syncing" }
+        return folders.isEmpty ? "Idle" : "Synced"
+    }
+
+    public var overallKind: FolderController.Kind {
+        if hasProblem { return .warn }
+        if isSyncing { return .busy }
+        return folders.isEmpty ? .off : .ok
+    }
+
     public var isSyncing: Bool {
         folders.contains {
             switch $0.status {

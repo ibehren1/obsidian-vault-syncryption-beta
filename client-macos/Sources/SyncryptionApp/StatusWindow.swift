@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import SyncryptionAppCore
+import SyncryptionSync
 
 /// Which folder the status window shows, so the menu can open it at one.
 @MainActor @Observable
@@ -141,14 +142,18 @@ struct FolderStatus: View {
                 Tile(label: "Last sync", value: folder.lastSync.map { relative($0, to: now, capitalized: true) } ?? "Never",
                      detail: folder.lastSync?.formatted(date: .abbreviated, time: .standard) ?? "No sync on this Mac yet", systemImage: "clock")
                 Tile(label: "Last run", value: r.map { "\($0.pushed) ↑  \($0.pulled) ↓" } ?? "—",
-                     detail: r == nil ? "Nothing run yet" : (extra.isEmpty ? "No merges or conflicts" : extra.joined(separator: " · ")),
-                     systemImage: "arrow.up.arrow.down")
+                     detail: runDetail(r, extra), systemImage: "arrow.up.arrow.down")
                 Tile(label: "Files in sync", value: folder.session == nil && folder.fileCount == 0 ? "—" : folder.fileCount.formatted(),
                      detail: "Full device", systemImage: "doc.on.doc")
                 Tile(label: "Waiting to upload", value: folder.engine == nil ? "—" : queue.count.formatted(),
                      detail: oldest.map { "Oldest \($0.formatted(date: .omitted, time: .shortened))" } ?? "", systemImage: "tray.and.arrow.up")
             }
         }
+    }
+
+    private func runDetail(_ r: SyncReport?, _ extra: [String]) -> String {
+        guard r != nil else { return "Nothing run yet" }
+        return extra.isEmpty ? "No merges or conflicts" : extra.joined(separator: " · ")
     }
 
     // MARK: Columns
@@ -251,8 +256,8 @@ struct FolderStatus: View {
                             Fingerprint(value: k.fingerprint)
                             Text(isoDate(k.added)?.formatted(date: .abbreviated, time: .omitted) ?? "—").foregroundStyle(.secondary)
                             HStack(spacing: 6) {
-                                StatusDot(kind: k.status == "active" ? (k.locked ? .warn : .ok) : k.status == "pending" ? .warn : .off, size: 7)
-                                Text(k.status == "active" ? (k.locked ? "Locked" : "Active") : k.status.capitalized)
+                                StatusDot(kind: k.serverKind, size: 7)
+                                Text(k.serverLabel)
                             }
                             Text(k.isThisMac ? "Now" : isoDate(k.lastSeenAt).map { relative($0, capitalized: true) } ?? "—").foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .trailing)

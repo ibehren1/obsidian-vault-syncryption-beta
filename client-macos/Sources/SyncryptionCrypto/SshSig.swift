@@ -19,17 +19,21 @@ public enum SshSig {
     private static let end = "-----END SSH SIGNATURE-----"
 
     private static func signedData(_ namespace: String, _ message: Bytes) -> Bytes {
-        magic + sshString(Bytes(utf8: namespace)) + sshString([]) + sshString(Bytes(utf8: hash))
-            + sshString(Primitives.sha512(message))
+        concat(magic, sshString(Bytes(utf8: namespace)), sshString([]), sshString(Bytes(utf8: hash)),
+               sshString(Primitives.sha512(message)))
     }
 
     public static func sign(seed: Bytes, namespace: String, message: Bytes) -> String {
         precondition(!namespace.isEmpty)
         let pk = Primitives.ed25519PublicKey(seed: seed)
         let sig = Primitives.ed25519Sign(seed: seed, signedData(namespace, message))
-        let blob = magic + u32be(1) + sshString(OpenSSH.publicKeyWire(pk)) + sshString(Bytes(utf8: namespace))
-            + sshString([]) + sshString(Bytes(utf8: hash)) + sshString(sshString(Bytes(utf8: keyType)) + sshString(sig))
-        return ([begin] + wrapLines(blob.base64, width: 70) + [end, ""]).joined(separator: "\n")
+        let signature = concat(sshString(Bytes(utf8: keyType)), sshString(sig))
+        let blob = concat(magic, u32be(1), sshString(OpenSSH.publicKeyWire(pk)), sshString(Bytes(utf8: namespace)),
+                          sshString([]), sshString(Bytes(utf8: hash)), sshString(signature))
+        var lines: [String] = [begin]
+        lines.append(contentsOf: wrapLines(blob.base64, width: 70))
+        lines.append(contentsOf: [end, ""])
+        return lines.joined(separator: "\n")
     }
 
     /// Verify an armored sshsig over `message` in `namespace`. Returns the signer's 32-byte

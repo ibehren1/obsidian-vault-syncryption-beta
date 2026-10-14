@@ -37,7 +37,7 @@ private let pemEnd = "-----END OPENSSH PRIVATE KEY-----"
 
 public enum OpenSSH {
     /// RFC 8709 public key wire format: string("ssh-ed25519") || string(pk32).
-    public static func publicKeyWire(_ pk: Bytes) -> Bytes { sshString(Bytes(utf8: keyType)) + sshString(pk) }
+    public static func publicKeyWire(_ pk: Bytes) -> Bytes { concat(sshString(Bytes(utf8: keyType)), sshString(pk)) }
 
     /// `ssh-ed25519 <base64> [comment]`, as in `authorized_keys`.
     public static func publicKeyText(_ pk: Bytes, comment: String = "") -> String {
@@ -126,13 +126,16 @@ public enum OpenSSH {
         precondition(seed.count == 32)
         let pk = Primitives.ed25519PublicKey(seed: seed)
         let check = checkint ?? UInt32.random(in: .min ... .max)
-        var body = u32be(check) + u32be(check) + sshString(Bytes(utf8: keyType)) + sshString(pk)
-            + sshString(seed + pk) + sshString(Bytes(utf8: comment))
+        var body = concat(u32be(check), u32be(check), sshString(Bytes(utf8: keyType)), sshString(pk),
+                          sshString(concat(seed, pk)), sshString(Bytes(utf8: comment)))
         let pad = (8 - body.count % 8) % 8
         body += (0..<pad).map { UInt8($0 + 1) }
-        var blob = magic + sshString(Bytes(utf8: "none")) + sshString(Bytes(utf8: "none")) + sshString([])
-            + u32be(1) + sshString(publicKeyWire(pk)) + sshString(body)
-        let text = ([pemBegin] + wrapLines(blob.base64, width: 70) + [pemEnd, ""]).joined(separator: "\n")
+        var blob = concat(magic, sshString(Bytes(utf8: "none")), sshString(Bytes(utf8: "none")), sshString([]),
+                          u32be(1), sshString(publicKeyWire(pk)), sshString(body))
+        var lines: [String] = [pemBegin]
+        lines.append(contentsOf: wrapLines(blob.base64, width: 70))
+        lines.append(contentsOf: [pemEnd, ""])
+        let text = lines.joined(separator: "\n")
         wipe(&body)
         wipe(&blob)
         return text
