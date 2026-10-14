@@ -57,7 +57,7 @@ jobs:
         if: steps.version.outputs.new == 'true'
         run: |
           gh release create "${{ steps.version.outputs.tag }}" "${{ steps.dmg.outputs.path }}" \
-            --title "macOS client ${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
             --target "$GITHUB_SHA" --prerelease --latest=false \
             --notes "Beta build of the macOS client. It is signed ad hoc, not with a Developer ID, so macOS blocks the first launch: right-click the app and choose Open, or run \`xattr -d com.apple.quarantine /Applications/VaultSyncryption.app\`."
         env:
