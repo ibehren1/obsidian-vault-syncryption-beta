@@ -7,10 +7,16 @@ import SyncryptionCrypto
 /// The device keys, one per server, user and vault (docs/crypto.md 3.3), in the login Keychain
 /// as `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` items: never synced to iCloud, and
 /// readable without a prompt once the Mac was unlocked after boot, so background sync works.
-public struct KeyStore: Sendable {
+public struct KeyStore: @unchecked Sendable {
     public let service: String
+    /// A keychain to use instead of the default (login) one: the tests' own, so they never
+    /// touch the user's keys and run as a user without a login keychain (a CI runner).
+    private let keychain: SecKeychain?
 
-    public init(service: String = "Vault Syncryption") { self.service = service }
+    public init(service: String = "Vault Syncryption", keychain: SecKeychain? = nil) {
+        self.service = service
+        self.keychain = keychain
+    }
 
     public struct Failure: Error, CustomStringConvertible {
         public let status: OSStatus
@@ -27,7 +33,10 @@ public struct KeyStore: Sendable {
     }
 
     private func query(_ slot: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: slot]
+        var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                kSecAttrAccount as String: slot]
+        if let keychain { q[kSecMatchSearchList as String] = [keychain] }
+        return q
     }
 
     /// The OpenSSH private key in `slot`, or nil.
@@ -51,6 +60,10 @@ public struct KeyStore: Sendable {
         q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         q[kSecAttrSynchronizable as String] = false
         q[kSecAttrLabel as String] = "Vault Syncryption encryption key"
+        if let keychain {
+            q[kSecMatchSearchList as String] = nil
+            q[kSecUseKeychain as String] = keychain
+        }
         let status = SecItemAdd(q as CFDictionary, nil)
         guard status == errSecSuccess else { throw Failure(status: status) }
     }

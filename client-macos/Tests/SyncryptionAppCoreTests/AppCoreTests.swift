@@ -1,9 +1,31 @@
 import Foundation
+import Security
 import SyncryptionCrypto
 import TestBackend
 import Testing
 
 @testable import SyncryptionAppCore
+
+/// The tests' own keychain, a file in the temporary folder kept out of the search list: the
+/// tests never touch the login keychain, and run as a user without one (the CI runner).
+enum TestKeychain {
+    nonisolated(unsafe) static let shared: SecKeychain = {
+        let path = FileManager.default.temporaryDirectory.appending(path: "syncryption-tests.keychain-db").path
+        let password = "syncryption-tests"
+        var keychain: SecKeychain?
+        var status = FileManager.default.fileExists(atPath: path)
+            ? SecKeychainOpen(path, &keychain)
+            : SecKeychainCreate(path, UInt32(password.utf8.count), password, false, nil, &keychain)
+        precondition(status == errSecSuccess && keychain != nil, "test keychain: \(status)")
+        status = SecKeychainUnlock(keychain, UInt32(password.utf8.count), password, true)
+        precondition(status == errSecSuccess, "test keychain unlock: \(status)")
+        var list: CFArray?
+        if SecKeychainCopySearchList(&list) == errSecSuccess, let all = list as? [SecKeychain], all.contains(keychain!) {
+            SecKeychainSetSearchList(all.filter { $0 != keychain! } as CFArray)
+        }
+        return keychain!
+    }()
+}
 
 @Suite struct ConfigTests {
     @Test func keySlotMatchesThePlugin() {
@@ -43,7 +65,7 @@ import Testing
     }
 
     @Test func keychainRoundTrip() throws {
-        let keys = KeyStore(service: "Vault Syncryption tests")
+        let keys = KeyStore(service: "Vault Syncryption tests", keychain: TestKeychain.shared)
         let slot = "syncryption-key-test-\(UUID().uuidString)"
         defer { try? keys.delete(slot) }
         #expect(try keys.load(slot) == nil)
@@ -64,7 +86,7 @@ struct AppModelTests {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         try Data("hello\n".utf8).write(to: folder.appending(path: "a.md"))
-        let keys = KeyStore(service: "Vault Syncryption tests")
+        let keys = KeyStore(service: "Vault Syncryption tests", keychain: TestKeychain.shared)
         let model = AppModel(configs: ConfigStore(directory: dir.appending(path: "support")), keys: keys, transport: { TestBackend.transport() })
         let c = try model.addFolder(path: folder.path, endpoint: try TestBackend.url()!, username: TestBackend.uniqueName("app"),
                                     vaultName: TestBackend.uniqueName("Vault "), deviceName: "Test Mac")
@@ -101,7 +123,7 @@ struct TwoMacsTests {
         defer { try? FileManager.default.removeItem(at: dir) }
         let (fa, fb) = (dir.appending(path: "A"), dir.appending(path: "B"))
         for f in [fa, fb] { try FileManager.default.createDirectory(at: f, withIntermediateDirectories: true) }
-        let keys = KeyStore(service: "Vault Syncryption tests")
+        let keys = KeyStore(service: "Vault Syncryption tests", keychain: TestKeychain.shared)
         let a = AppModel(configs: ConfigStore(directory: dir.appending(path: "supportA")), keys: keys, transport: { TestBackend.transport() })
         let b = AppModel(configs: ConfigStore(directory: dir.appending(path: "supportB")), keys: keys, transport: { TestBackend.transport() })
         let url = try TestBackend.url()!
@@ -116,7 +138,7 @@ struct TwoMacsTests {
 
         // B's key is in another Keychain slot only if its endpoint differs; same vault on two
         // Macs is two keychains, so give B its own service.
-        let keysB = KeyStore(service: "Vault Syncryption tests B")
+        let keysB = KeyStore(service: "Vault Syncryption tests B", keychain: TestKeychain.shared)
         let b2 = AppModel(configs: ConfigStore(directory: dir.appending(path: "supportB2")), keys: keysB, transport: { TestBackend.transport() })
         _ = b
         let cb = try b2.addFolder(path: fb.path, endpoint: url, username: user, vaultName: vault, deviceName: "Mac B")
