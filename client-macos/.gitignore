@@ -2,3 +2,5 @@
 .swiftpm/
 VaultSyncryption.xcodeproj/
 App/Info.plist
+SyncryptionFinder/Info.plist
+SyncryptionFinder/SyncryptionFinder.entitlements

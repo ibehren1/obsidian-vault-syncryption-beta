@@ -51,8 +51,9 @@ struct SessionTests {
         let a = try await device(username, vaultName, "Laptop")
         let codes = Log()
         let asked = Log()
+        let seed = Primitives.random(32)
         let waiting = Task {
-            try await connectNew(username, " \(vaultName) ", name: "Tablet",
+            try await connectNew(username, " \(vaultName) ", name: "Tablet", seed: seed,
                                  callbacks: Callbacks(secret: nil, onPairing: { codes.add($0) }, onAsk: { asked.add("asked") }))
         }
         while codes.all.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
@@ -61,6 +62,7 @@ struct SessionTests {
         #expect(asked.all.isEmpty)
         let pending = try await a.session.pendingDevices()
         #expect(codes.all == pending.map(\.code))
+        #expect(pending.map(\.fingerprint) == [OpenSSH.fingerprint(Primitives.ed25519PublicKey(seed: seed))])
     }
 
     @Test func catchesUpOnKeyringVersionsItMissed() async throws {
@@ -167,6 +169,47 @@ struct SessionTests {
         #expect(try await a.engine.sync().reencrypted == 2)
         await #expect { try await b.engine.sync() } throws: { ($0 as? ApiError)?.isRevoked == true }
         await #expect(throws: VaultSession.Refused.self) { try await a.session.removeDevice(await a.session.deviceId()) }
+    }
+
+    @Test func finishesItsOwnRemovalWhoseRotationDidntHappen() async throws {
+        let username = TestBackend.uniqueName("stale")
+        let vaultName = TestBackend.uniqueName("Vault ")
+        let a = try await device(username, vaultName, "Laptop")
+        let b = try await pairedDevice(a, username, vaultName, "Phone")
+        let c = try await pairedDevice(a, username, vaultName, "Tablet")
+        let tablet = await c.session.deviceId()
+        // Revoked on the server, but this device stopped before rotating.
+        try a.store.setMeta(MetaKey.revokingDevices, [tablet])
+        try await a.session.api.removeDevice(a.session.vault.id, tablet)
+        #expect(try await a.session.removeStaleDevices() == .init(removed: ["Tablet"], unconfirmed: []))
+        #expect(a.session.keyring.currentEpoch == 2)
+        #expect(try a.store.meta(MetaKey.revokingDevices, as: [String].self) == [])
+        #expect(try await b.session.removeStaleDevices() == .init(removed: [], unconfirmed: []))
+        #expect(b.session.keyring.devices.map(\.name).sorted() == ["Laptop", "Phone"])
+    }
+
+    @Test func leavesAnotherDevicesRemovalToTheUser() async throws {
+        let username = TestBackend.uniqueName("stale")
+        let vaultName = TestBackend.uniqueName("Vault ")
+        let a = try await device(username, vaultName, "Laptop")
+        let b = try await pairedDevice(a, username, vaultName, "Phone")
+        let c = try await pairedDevice(a, username, vaultName, "Tablet")
+        let tablet = await c.session.deviceId()
+        // The server reports Tablet removed, but no device here removed it.
+        try await a.session.api.removeDevice(a.session.vault.id, tablet)
+        let stale = try await b.session.removeStaleDevices()
+        #expect(stale.removed.isEmpty)
+        #expect(stale.unconfirmed.map(\.name) == ["Tablet"])
+        #expect(b.session.keyring.currentEpoch == 1)
+
+        try await b.session.keepDevices([tablet])
+        #expect(try await b.session.removeStaleDevices() == .init(removed: [], unconfirmed: []))
+        #expect(b.session.keyring.devices.map(\.name).contains("Tablet"))
+
+        // Removing it later still works, and forgets the choice.
+        try await b.session.removeDevices([tablet])
+        #expect(b.session.keyring.currentEpoch == 2)
+        #expect(try b.store.meta(MetaKey.keptDevices, as: [String].self) == [])
     }
 
     @Test func replacesThisDevicesKey() async throws {

@@ -24,6 +24,7 @@ import Testing
         try store.putFile(nfd, f)
         #expect(try store.files().count == 2)
         #expect(try store.countFiles() == 2)
+        #expect(try store.totalSize() == 2 * f.size)
         try store.removeFile(nfd)
         #expect(try Array(store.files().keys) == [PathKey(nfc)])
 

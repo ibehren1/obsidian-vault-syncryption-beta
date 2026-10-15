@@ -62,11 +62,18 @@ public enum MetaKey {
     public static let vaultId = "vaultId"
     /// The device whose key this device replaced, until it is removed (hand-over).
     public static let replacedDevice = "replacedDevice"
+    /// The devices this device started removing, until the keyring is rotated.
+    public static let revokingDevices = "revokingDevices"
+    /// Devices the server reports removed that the user chose to keep in the keyring.
+    public static let keptDevices = "keptDevices"
 }
 
 extension SyncStore {
     /// The paths in sync: the synced files, without deletions.
     public func countFiles() throws -> Int { try files().values.filter { !$0.deleted }.count }
+
+    /// The plaintext bytes in sync: the sizes of the synced files, without deletions.
+    public func totalSize() throws -> Int { try files().values.filter { !$0.deleted }.reduce(0) { $0 + $1.size } }
 }
 
 /// Paths are compared by their exact characters, not Swift's canonical equivalence: on disk

@@ -1,5 +1,6 @@
 import Foundation
 import SyncryptionAPI
+import SystemConfiguration
 
 /// One synced folder: the plugin's settings (endpoint, username, vault name, device name,
 /// encryption key and the exclude list), plus where the folder is.
@@ -110,8 +111,15 @@ public struct ConfigStore: Sendable {
     }
 }
 
-/// The device name to suggest: the Mac's name, up to 64 characters.
+/// The device name to suggest: the Mac's name (System Settings → General → About), up to 64
+/// characters. Read from the system configuration, which answers at once: `Host.current()`
+/// resolves the machine's network names first and can block for a long time.
 public func defaultDeviceName() -> String {
-    let name = Host.current().localizedName?.trimmingCharacters(in: .whitespaces) ?? ""
+    let computer = SCDynamicStoreCopyComputerName(nil, nil) as String?
+    var name = (computer ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if name.isEmpty {
+        // The local host name ("Isaacs-MacBook"), without the ".local".
+        name = (SCDynamicStoreCopyLocalHostName(nil) as String?) ?? ""
+    }
     return String((name.isEmpty ? "Mac" : name).prefix(64))
 }

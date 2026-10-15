@@ -99,6 +99,7 @@ struct GeneralTab: View {
     let model: AppModel
     @State private var exclude = ""
     @State private var confirmRemove = false
+    @State private var finderExtensionOn = true
 
     var body: some View {
         Form {
@@ -142,12 +143,27 @@ struct GeneralTab: View {
             Section {
                 Toggle("Show the Vault Syncryption icon on the folder in Finder",
                        isOn: Binding(get: { folder.config.showsFolderIcon }, set: { folder.setShowsFolderIcon($0) }))
+                if folder.config.showsFolderIcon && !finderExtensionOn {
+                    HStack {
+                        Text("Finder's sidebar shows the icon only with the Vault Syncryption Finder extension on.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Finder Extensions…") { FinderExtension.showSettings() }
+                    }
+                }
                 Toggle("Paused", isOn: Binding(get: { folder.config.paused }, set: { folder.setPaused($0) }))
                 Button("Remove Folder…", role: .destructive) { confirmRemove = true }
             }
         }
         .formStyle(.grouped)
-        .onAppear { exclude = folder.config.exclude }
+        .onAppear {
+            exclude = folder.config.exclude
+            finderExtensionOn = FinderExtension.isEnabled
+        }
+        // Back from System Settings.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            finderExtensionOn = FinderExtension.isEnabled
+        }
         .confirmationDialog("Stop syncing \(folder.config.title)?", isPresented: $confirmRemove) {
             Button("Remove Folder", role: .destructive) { Task { await model.removeFolder(folder) } }
         } message: {
@@ -200,6 +216,29 @@ struct KeyTab: View {
     }
 }
 
+/// A key the server reports removed that this Mac didn't remove: the user removes or keeps it.
+struct StaleKeyRow: View {
+    let key: FolderController.StaleKey
+    let remove: () -> Void
+    let keep: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "person.badge.minus").font(.title3).foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("The server reports \(key.name)'s key removed").font(.body.weight(.medium))
+                Text("This Mac didn't remove it. If you removed it on another device, remove it here too, so the vault gets a new key. If you didn't, keep it: the server alone can't decide who is in the vault.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Button("Keep", action: keep)
+            Button("Remove", role: .destructive, action: remove)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.08)))
+    }
+}
+
 struct DevicesTab: View {
     let folder: FolderController
     @State private var keys: [FolderController.VaultKey] = []
@@ -228,15 +267,13 @@ struct DevicesTab: View {
                     .padding(12)
                     .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.08)))
                 }
+                ForEach(folder.unconfirmedRemovals) { s in
+                    StaleKeyRow(key: s, remove: { act { try await folder.confirmRemoval([s.id]) } },
+                                keep: { act { try await folder.keepKeys([s.id]) } })
+                }
                 Card(title: "Keys of \(folder.config.vaultName)", count: keys.isEmpty ? nil : plural(keys.count, "key")) {
                     HStack(spacing: 8) {
                         if loading { ProgressView().controlSize(.small) }
-                        Button("Clean Up Removed Keys") {
-                            act {
-                                let n = try await folder.removeStaleKeys()
-                                info = n.isEmpty ? "Nothing to clean up." : "Removed \(n.joined(separator: ", "))."
-                            }
-                        }
                         Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }.help("Refresh")
                     }
                 } content: {
@@ -289,7 +326,8 @@ struct DevicesTab: View {
 
     @ViewBuilder
     private func actions(_ k: FolderController.VaultKey) -> some View {
-        if !k.isThisMac && k.status != "revoked" {
+        // A revoked key still in the keyring was kept (or not decided yet): it can still be removed.
+        if !k.isThisMac && (k.status != "revoked" || k.inKeyring) {
             Menu {
                 if k.status == "active" && k.inKeyring {
                     Button(k.remoteOnly ? "Make Full Device" : "Make Remote-Only") { act { try await folder.setRemoteOnly(k.id, !k.remoteOnly) } }

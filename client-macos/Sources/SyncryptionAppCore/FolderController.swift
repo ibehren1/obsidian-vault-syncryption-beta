@@ -38,6 +38,8 @@ public final class FolderController: Identifiable {
     public private(set) var config: FolderConfig
     public private(set) var status: Status = .idle
     public private(set) var fileCount = 0
+    /// The plaintext size of those files, in bytes.
+    public private(set) var totalSize = 0
     public private(set) var pendingCount = 0
     public private(set) var lastSync: Date?
     public private(set) var lastReport: SyncReport?
@@ -48,6 +50,8 @@ public final class FolderController: Identifiable {
     public private(set) var engine: SyncEngine?
     /// Keys of the vault waiting for approval, with the pairing code computed here.
     public private(set) var pendingApprovals: [PendingDevice] = []
+    /// Keys the server reports removed that this Mac didn't remove: Remove or Keep is the user's.
+    public internal(set) var unconfirmedRemovals: [StaleKey] = []
     /// This folder's public key and fingerprint, for the Encryption Key view.
     public var publicKeyText: String { config.publicKey }
 
@@ -282,6 +286,7 @@ public final class FolderController: Identifiable {
             let engine = SyncEngine(o)
             guard self.session === session else { return }
             self.engine = engine
+            Task { await self.finishRemovals(session) }
 
             watcher = FolderWatcher(root: config.url) { [weak self] paths in
                 Task { @MainActor in self?.noteChanges(paths) }
@@ -369,6 +374,11 @@ public final class FolderController: Identifiable {
         }
     }
 
+    public struct StaleKey: Identifiable, Equatable, Sendable {
+        public let id: String
+        public let name: String
+    }
+
     public struct PendingDevice: Identifiable, Equatable, Sendable {
         public let id: String
         public let name: String
@@ -382,7 +392,7 @@ public final class FolderController: Identifiable {
         let before = Set(pendingApprovals.map(\.id))
         guard let list = try? await session.pendingDevices() else { return }
         pendingApprovals = list.map { PendingDevice(id: $0.device.id, name: $0.device.name, publicKey: $0.device.publicKey, code: $0.code,
-                                                     fingerprint: $0.device.fingerprint) }
+                                                     fingerprint: $0.fingerprint) }
         let new = pendingApprovals.filter { !before.contains($0.id) }
         if !new.isEmpty { onPendingApproval(self, new) }
     }
@@ -393,6 +403,7 @@ public final class FolderController: Identifiable {
     private func refreshCounts() async {
         guard let engine else { return }
         fileCount = (try? await engine.fileCount()) ?? fileCount
+        totalSize = (try? await engine.totalSize()) ?? totalSize
         pendingCount = (try? await engine.pending().count) ?? pendingCount
     }
 

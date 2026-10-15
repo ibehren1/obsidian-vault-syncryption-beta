@@ -10,7 +10,7 @@ extension FolderController {
         case .pairing(let code, _): "Waiting for approval · code \(code)"
         case .syncing(let what): what
         case .synced(let at):
-            "Synced \(at.formatted(date: .omitted, time: .shortened)) · \(fileCount) \(fileCount == 1 ? "file" : "files")"
+            "Synced \(at.formatted(date: .omitted, time: .shortened)) · \(fileCount) \(fileCount == 1 ? "file" : "files") · \(sizeText)"
                 + (pendingCount > 0 ? " · \(pendingCount) waiting" : "")
         case .offline(let why): why
         case .paused: "Paused"
@@ -20,6 +20,9 @@ extension FolderController {
         case .keyProblem(let why): why
         }
     }
+
+    /// The size of the files in sync, as Finder writes it ("1.2 MB").
+    public var sizeText: String { totalSize.formatted(.byteCount(style: .file)) }
 
     /// An SF Symbol for the status.
     public var statusSymbol: String {

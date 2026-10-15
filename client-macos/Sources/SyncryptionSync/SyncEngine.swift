@@ -153,6 +153,9 @@ public actor SyncEngine {
     /// How many files are in sync: those with a synced state that isn't a deletion.
     public func fileCount() throws -> Int { try o.store.countFiles() }
 
+    /// The plaintext size of the files in sync, in bytes.
+    public func totalSize() throws -> Int { try o.store.totalSize() }
+
     /// Synced paths that exist (not deletions), sorted: the files with a history to browse.
     public func syncedPaths() throws -> [String] {
         try o.store.files().filter { !$0.value.deleted && o.filter.includes($0.key.path) }.map(\.key.path).sorted()

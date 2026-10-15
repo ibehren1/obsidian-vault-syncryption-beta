@@ -55,6 +55,9 @@ enum Snapshot {
                 await render(SettingsView(model: model), size: CGSize(width: 900, height: 640), to: dir.appending(path: "\(name).png"))
             }
             await render(AddFolderView(model: model), size: nil, to: dir.appending(path: "add.png"))
+            await render(WelcomeView(model: model), size: nil, to: dir.appending(path: "welcome.png"))
+            let windows = NSApp.windows.filter { $0.isVisible }.map { $0.title }
+            try? windows.joined(separator: "\n").write(to: dir.appending(path: "launch-windows.txt"), atomically: true, encoding: .utf8)
             if let icon = FolderIcon.image(), let tiff = icon.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) {
                 try? rep.representation(using: .png, properties: [:])?.write(to: dir.appending(path: "folder-icon.png"))
             }

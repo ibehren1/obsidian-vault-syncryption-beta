@@ -77,8 +77,10 @@ extension FolderController {
         let order = ["active": 0, "pending": 1, "revoked": 2]
         return try await session.devices().map { d in
             let entry = keyring.devices.first { $0.id == d.id }
-            return VaultKey(id: d.id, name: d.name, status: d.status, fingerprint: d.fingerprint,
-                            pairingCode: (try? OpenSSH.pairingCode(OpenSSH.parsePublicKeyText(d.publicKey))) ?? d.pairingCode,
+            // Computed here from the key, not taken from the server, which could name another key.
+            let pk = try? OpenSSH.parsePublicKeyText(d.publicKey)
+            return VaultKey(id: d.id, name: d.name, status: d.status, fingerprint: pk.map(OpenSSH.fingerprint) ?? "Unreadable key",
+                            pairingCode: pk.map(OpenSSH.pairingCode) ?? "—",
                             publicKey: d.publicKey, remoteOnly: entry?.policy == Keyring.remoteOnly, locked: d.locked ?? false,
                             lastSeenAt: d.lastSeenAt, createdAt: d.createdAt, isThisMac: d.id == me, inKeyring: entry != nil,
                             added: entry?.added)
@@ -106,11 +108,25 @@ extension FolderController {
         try await connected().setLocked(deviceId: id, locked: locked)
     }
 
-    /// Finish removals done elsewhere whose key rotation didn't happen. Returns their names.
-    public func removeStaleKeys() async throws -> [String] {
-        let names = try await connected().removeStaleDevices()
-        if !names.isEmpty { syncNow() }
-        return names
+    /// Remove keys the server reports removed, after the user confirmed it (`unconfirmedRemovals`).
+    public func confirmRemoval(_ ids: [String]) async throws {
+        try await connected().removeDevices(ids)
+        unconfirmedRemovals.removeAll { ids.contains($0.id) }
+        syncNow()
+    }
+
+    /// Keep keys the server reports removed: they aren't offered for removal again.
+    public func keepKeys(_ ids: [String]) async throws {
+        try await connected().keepDevices(ids)
+        unconfirmedRemovals.removeAll { ids.contains($0.id) }
+    }
+
+    /// Finish this Mac's own removals that didn't rotate the key, and collect the keys the
+    /// server reports removed that this Mac didn't remove, for the user to decide.
+    func finishRemovals(_ session: VaultSession) async {
+        guard let stale = try? await session.removeStaleDevices(), self.session === session else { return }
+        unconfirmedRemovals = stale.unconfirmed.map { StaleKey(id: $0.id, name: $0.name) }
+        if !stale.removed.isEmpty { syncNow() }
     }
 
     // MARK: Status

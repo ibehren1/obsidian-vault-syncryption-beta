@@ -7,6 +7,7 @@ struct MenuView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var opensAtLogin = false
     @State private var loginError: String?
+    @State private var dock = DockIcon.isOn
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -47,6 +48,10 @@ struct MenuView: View {
                 }
                 .toggleStyle(.checkbox).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.vertical, 5)
                 if let loginError { Text(loginError).font(.caption).foregroundStyle(.red).padding(.horizontal, 10) }
+                Toggle(isOn: Binding(get: { dock }, set: { dock = $0; DockIcon.set($0) })) {
+                    Text("Show in Dock").padding(.leading, 4)
+                }
+                .toggleStyle(.checkbox).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.vertical, 5)
             }
             .padding(6)
             Divider()
@@ -71,7 +76,7 @@ struct MenuView: View {
     private var summary: String {
         let n = model.folders.count
         if n == 0 { return "No folders" }
-        let attention = model.folders.filter { [.warn, .error].contains($0.statusKind) || !$0.pendingApprovals.isEmpty }.count
+        let attention = model.folders.filter { [.warn, .error].contains($0.statusKind) || !$0.pendingApprovals.isEmpty || !$0.unconfirmedRemovals.isEmpty }.count
         let files = model.folders.reduce(0) { $0 + $1.fileCount }
         if attention == 1 { return "1 folder needs attention" }
         if attention > 1 { return "\(attention) folders need attention" }
@@ -162,6 +167,16 @@ struct FolderRow: View {
                 }
                 .padding(.leading, 34)
             }
+            if !folder.unconfirmedRemovals.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "person.badge.minus").foregroundStyle(.orange)
+                    Text(folder.unconfirmedRemovals.count == 1 ? "The server reports \(folder.unconfirmedRemovals[0].name) removed"
+                        : "The server reports \(folder.unconfirmedRemovals.count) devices removed").font(.caption)
+                    Spacer()
+                    Button("Review…") { open(.devices) }.controlSize(.small)
+                }
+                .padding(.leading, 34)
+            }
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(hover ? Color.primary.opacity(0.05) : .clear))
@@ -174,7 +189,7 @@ struct FolderRow: View {
     private var line: String {
         switch folder.status {
         case .synced(let at):
-            return "Synced \(relative(at)) · \(plural(folder.fileCount, "file"))" + (folder.pendingCount > 0 ? " · \(folder.pendingCount) waiting" : "")
+            return "Synced \(relative(at)) · \(plural(folder.fileCount, "file")) · \(folder.sizeText)" + (folder.pendingCount > 0 ? " · \(folder.pendingCount) waiting" : "")
         default:
             return folder.statusText
         }

@@ -71,10 +71,12 @@ struct AppModelTests {
         defer { try? keys.delete(c.config.keySlot) }
         for _ in 0..<200 where c.status != .needsSecret { try await Task.sleep(for: .milliseconds(25)) }
         #expect(c.status == .needsSecret)
+        #expect(model.menuBarKind == .error)
         c.provideSecret(TestBackend.sharedSecret)
         for _ in 0..<400 where c.fileCount != 1 { try await Task.sleep(for: .milliseconds(25)) }
         #expect(c.fileCount == 1)
         guard case .synced = c.status else { Issue.record("status \(c.status)"); return }
+        #expect(model.menuBarKind == .ok)
         #expect(throws: (any Error).self) {
             try model.addFolder(path: folder.path, endpoint: try TestBackend.url()!, username: c.config.username,
                                 vaultName: c.config.vaultName, deviceName: "Test Mac")

@@ -133,8 +133,13 @@ public actor VaultSession: KeyringSource {
     public func devices() async throws -> [Device] { try await api.devices(vault.id) }
 
     /// Keys waiting for approval, with the pairing code computed here, not by the server.
-    public func pendingDevices() async throws -> [(device: Device, code: String)] {
-        try await devices().filter { $0.status == "pending" }.map { ($0, OpenSSH.pairingCode(try OpenSSH.parsePublicKeyText($0.publicKey))) }
+    /// Keys waiting for approval. The pairing code and fingerprint are computed here from the
+    /// public key that approving adds: the server's `fingerprint` could name another key.
+    public func pendingDevices() async throws -> [(device: Device, code: String, fingerprint: String)] {
+        try await devices().filter { $0.status == "pending" }.map { d in
+            let key = try OpenSSH.parsePublicKeyText(d.publicKey)
+            return (d, OpenSSH.pairingCode(key), OpenSSH.fingerprint(key))
+        }
     }
 
     /// Pairing, active side (crypto.md 6.5): add the key to the keyring, upload it signed,
@@ -178,23 +183,56 @@ public actor VaultSession: KeyringSource {
     /// Revocation (crypto.md 8.4): revoke the key on the server first, then remove it from the
     /// keyring with a new epoch. Other devices re-encrypt their files in the background.
     public func removeDevice(_ target: String) async throws {
-        guard target != (await deviceId()) else { throw Refused(description: "This device can't remove its own key.") }
-        do { try await api.removeDevice(vault.id, target) } catch let e as ApiError where e.status == 404 {
-            // Already gone from the server: the keyring still has to follow.
-        }
-        try await rotateOut([target])
+        try await removeDevices([target])
     }
 
-    /// Finish revocations done elsewhere: remove keyring devices whose key is revoked or gone
-    /// on the server. Returns their names.
-    public func removeStaleDevices() async throws -> [String] {
+    /// `removeDevice` for several keys, with one rotation.
+    public func removeDevices(_ ids: [String]) async throws {
+        guard !ids.contains(await deviceId()) else { throw Refused(description: "This device can't remove its own key.") }
+        // Noted first, so an interrupted removal is finished at the next start without asking.
+        try updateList(MetaKey.revokingDevices) { l in l + ids.filter { !l.contains($0) } }
+        for id in ids {
+            do { try await api.removeDevice(vault.id, id) } catch let e as ApiError where e.status == 404 {
+                // Already gone from the server: the keyring still has to follow.
+            }
+        }
+        try await rotateOut(ids)
+        try updateList(MetaKey.revokingDevices) { $0.filter { !ids.contains($0) } }
+        try updateList(MetaKey.keptDevices) { $0.filter { !ids.contains($0) } }
+    }
+
+    public struct StaleDevices: Equatable, Sendable {
+        /// The names of the devices whose removal this device finished.
+        public let removed: [String]
+        /// Devices the server reports removed that this device didn't remove: the user decides.
+        public let unconfirmed: [KeyringDevice]
+    }
+
+    /// Keyring devices whose key is revoked or gone on the server. Those this device started
+    /// removing are removed from the keyring (a rotation that didn't finish); the others are
+    /// returned, apart from those the user chose to keep: only the user decides that another
+    /// device's removal is real, since the server's word alone could expel a legitimate device.
+    public func removeStaleDevices() async throws -> StaleDevices {
         let status = Dictionary(try await devices().map { ($0.id, $0.status) }, uniquingKeysWith: { a, _ in a })
         try await refreshKeyring()
         let me = await deviceId()
         let stale = keyring.devices.filter { $0.id != me && (status[$0.id] ?? "revoked") == "revoked" }
-        if stale.isEmpty { return [] }
-        try await rotateOut(stale.map(\.id))
-        return stale.map(\.name)
+        let revoking = try list(MetaKey.revokingDevices), kept = try list(MetaKey.keptDevices)
+        let own = stale.filter { revoking.contains($0.id) }
+        if !own.isEmpty { try await removeDevices(own.map(\.id)) }
+        return StaleDevices(removed: own.map(\.name),
+                            unconfirmed: stale.filter { !revoking.contains($0.id) && !kept.contains($0.id) })
+    }
+
+    /// The user keeps these devices in the keyring although the server reports them removed.
+    public func keepDevices(_ ids: [String]) throws {
+        try updateList(MetaKey.keptDevices) { l in l + ids.filter { !l.contains($0) } }
+    }
+
+    private func list(_ key: String) throws -> [String] { try store.meta(key, as: [String].self) ?? [] }
+
+    private func updateList(_ key: String, _ change: ([String]) -> [String]) throws {
+        try store.setMeta(key, change(try list(key)))
     }
 
     /// After a key change (`handOver`): remove the replaced key, if this is the new one.

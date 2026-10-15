@@ -52,7 +52,7 @@ public final class AppModel {
         folders.contains {
             switch $0.status {
             case .error, .refused, .revoked, .needsSecret, .pairing, .keyProblem: true
-            default: !$0.pendingApprovals.isEmpty
+            default: !$0.pendingApprovals.isEmpty || !$0.unconfirmedRemovals.isEmpty
             }
         }
     }
@@ -68,6 +68,15 @@ public final class AppModel {
         if hasProblem { return .warn }
         if isSyncing { return .busy }
         return folders.isEmpty ? .off : .ok
+    }
+
+    /// The menu bar icon's color: a problem, syncing, or every folder synced. Anything else
+    /// (offline, paused, no folders) is `.off`, the plain menu bar icon.
+    public var menuBarKind: FolderController.Kind {
+        if hasProblem { return .error }
+        if isSyncing { return .busy }
+        let synced = folders.allSatisfy { if case .synced = $0.status { true } else { false } }
+        return !folders.isEmpty && synced ? .ok : .off
     }
 
     public var isSyncing: Bool {

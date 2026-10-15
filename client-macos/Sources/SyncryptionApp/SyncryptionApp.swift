@@ -13,7 +13,7 @@ struct SyncryptionApp: App {
         MenuBarExtra {
             MenuView(model: delegate.model)
         } label: {
-            Image(systemName: delegate.model.hasProblem ? "exclamationmark.lock" : "lock.rotation")
+            MenuBarLabel(model: delegate.model)
         }
         .menuBarExtraStyle(.window)
 
@@ -21,16 +21,25 @@ struct SyncryptionApp: App {
             StatusWindow(model: delegate.model)
         }
         .defaultSize(width: 920, height: 720)
+        .defaultLaunchBehavior(.suppressed)
+
+        Window("Welcome", id: "welcome") {
+            WelcomeView(model: delegate.model)
+        }
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(delegate.model.folders.isEmpty ? .presented : .suppressed)
 
         Window("Add Folder", id: "add") {
             AddFolderView(model: delegate.model)
         }
         .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
 
         Window("Vault Syncryption Settings", id: "settings") {
             SettingsView(model: delegate.model)
         }
         .defaultSize(width: 860, height: 620)
+        .defaultLaunchBehavior(.suppressed)
     }
 }
 
@@ -44,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         FolderIcon.logo = NSImage(named: "Logo")
+        FinderExtension.turnOnOnce()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         model.onPendingApproval = { folder, devices in
             let content = UNMutableNotificationContent()
@@ -53,6 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
         }
         model.startAll()
+        // A menu bar app isn't active at launch: bring the welcome window forward.
+        if model.folders.isEmpty { activate() }
         #if DEBUG
         Snapshot.runIfAsked(model)
         #endif
@@ -60,6 +72,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         model.stopAll()
+    }
+
+    /// Opening the app again (from Finder, Launchpad or the Dock) while it runs shows its
+    /// status window: the way in when the menu bar can't show the icon.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { WindowOpener.shared.open(model.folders.isEmpty ? "welcome" : "status") }
+        return true
+    }
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        DockIcon.apply()
+    }
+}
+
+/// The menu bar icon. It also hands SwiftUI's window opener to the app delegate, which has no
+/// SwiftUI environment of its own.
+struct MenuBarLabel: View {
+    let model: AppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        icon.onAppear { WindowOpener.shared.openWindow = openWindow }
+    }
+
+    /// Green when every folder is synced, yellow while syncing, red when one needs attention.
+    /// The menu bar draws SwiftUI images as templates, so a colored icon has to be an NSImage
+    /// that isn't one.
+    private var icon: Image {
+        let name = model.hasProblem ? "exclamationmark.lock" : "lock.rotation"
+        let color: NSColor? = switch model.menuBarKind {
+        case .ok: .systemGreen
+        case .busy: .systemYellow
+        case .error, .warn: .systemRed
+        case .off: nil
+        }
+        guard let color, let symbol = NSImage(systemSymbolName: name, accessibilityDescription: "Vault Syncryption")?
+            .withSymbolConfiguration(.init(paletteColors: [color])) else { return Image(systemName: name) }
+        symbol.isTemplate = false
+        return Image(nsImage: symbol)
+    }
+}
+
+/// Opens a window scene by id from outside a view.
+@MainActor
+final class WindowOpener {
+    static let shared = WindowOpener()
+    var openWindow: OpenWindowAction?
+
+    func open(_ id: String) {
+        openWindow?(id: id)
+        activate()
+    }
+}
+
+/// Whether the app shows in the Dock as well as the menu bar (for a menu bar too full to show
+/// its icon). Off by default.
+@MainActor
+enum DockIcon {
+    static let key = "showsDockIcon"
+
+    static var isOn: Bool { UserDefaults.standard.bool(forKey: key) }
+
+    static func set(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: key)
+        apply()
+    }
+
+    static func apply() {
+        NSApp.setActivationPolicy(isOn ? .regular : .accessory)
     }
 }
 
