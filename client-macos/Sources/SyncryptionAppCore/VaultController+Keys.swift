@@ -1,14 +1,15 @@
+import AppKit
 import Foundation
 import SyncryptionAPI
 import SyncryptionCrypto
 import SyncryptionStore
 import SyncryptionSync
 
-/// Vault management from a connected folder (docs/protocol.md 6 and 7, crypto.md 6, 8.4 and 9):
+/// Vault management once connected (docs/protocol.md 6 and 7, crypto.md 6, 8.4 and 9):
 /// the keys of the vault, the recovery key, file history, and replacing this Mac's key.
-extension FolderController {
+extension VaultController {
     public struct NotConnected: Error, CustomStringConvertible {
-        public let description = "This folder isn't connected to its vault. Wait until it is, or choose Try Again."
+        public let description = "This Mac isn't connected to the vault. Wait until it is, or choose Try Again."
     }
 
     func connected() throws -> VaultSession {
@@ -21,7 +22,7 @@ extension FolderController {
         return engine
     }
 
-    // MARK: This folder's key
+    // MARK: This Mac's key
 
     public struct KeyInfo: Equatable, Sendable {
         public let fingerprint: String
@@ -55,7 +56,7 @@ extension FolderController {
         public let added: String?
 
         /// The server's view of the key, for its dot.
-        public var serverKind: FolderController.Kind {
+        public var serverKind: VaultController.Kind {
             switch status {
             case "active": locked ? .warn : .ok
             case "pending": .warn
@@ -133,14 +134,44 @@ extension FolderController {
 
     public struct QueuedChange: Identifiable, Sendable {
         public var id: String { path }
+        /// The file, or the package its changes are in.
         public let path: String
         public let queuedAt: Date
+        /// How many changed files: more than one only for a package.
+        public let files: Int
+        /// Why a package waits, for display.
+        public let note: String?
     }
 
-    /// The local changes waiting to upload, oldest first.
+    /// The local changes waiting to upload, oldest first. The changes in one package are one.
     public func queuedChanges() async -> [QueuedChange] {
         guard let engine else { return [] }
-        return ((try? await engine.pending()) ?? []).map { QueuedChange(path: $0.path, queuedAt: Date(timeIntervalSince1970: $0.queuedAt / 1000)) }
+        var order: [PathKey] = []
+        var groups: [PathKey: (queuedAt: Double, files: Int)] = [:]
+        for e in (try? await engine.pending()) ?? [] {
+            let key = PathKey(engine.packageRoot(e.path) ?? e.path)
+            if let g = groups[key] {
+                groups[key] = (min(g.queuedAt, e.queuedAt), g.files + 1)
+            } else {
+                order.append(key)
+                groups[key] = (e.queuedAt, 1)
+            }
+        }
+        return order.map { key in
+            let g = groups[key]!
+            return QueuedChange(path: key.path, queuedAt: Date(timeIntervalSince1970: g.queuedAt / 1000), files: g.files,
+                                note: heldPackages.first { PathKey($0.key) == key }.map { Self.holdText($0.value) })
+        }
+    }
+
+    static func holdText(_ reason: HoldReason) -> String {
+        switch reason {
+        case .settling: return "Waiting until it stops changing"
+        case .inUse(let pid):
+            let app = NSRunningApplication(processIdentifier: pid)?.localizedName ?? OpenFiles.processName(pid) ?? "another app"
+            return "In use by \(app)"
+        case .uploading(let device): return "Being uploaded by \(device)"
+        }
     }
 
     /// This Mac's id in the vault, once connected.
@@ -197,7 +228,7 @@ extension FolderController {
 
     // MARK: Replacing this Mac's key
 
-    /// Replace this folder's key: the new key joins the vault, this key approves it, the new
+    /// Replace this Mac's key: the new key joins the vault, this key approves it, the new
     /// key is saved, and its session removes the old one and rotates the vault key.
     public func replaceKey() async throws {
         let session = try connected()

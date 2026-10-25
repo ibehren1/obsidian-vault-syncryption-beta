@@ -157,6 +157,11 @@ public actor ApiClient {
         try await call("PUT", "\(vaultPath(vaultId))/devices/\(enc(deviceId))/lock", json: LockRequest(locked: locked))
     }
 
+    /// Set or clear this device's metadata, already encrypted (crypto.md 8.5).
+    public func setDeviceMeta(_ vaultId: String, _ meta: Bytes?) async throws -> Device {
+        try await call("PUT", "\(vaultPath(vaultId))/devices/self/meta", json: MetaUpload(meta: meta?.b64u))
+    }
+
     /// Revoke a key of the vault (it may be this one) and end its sessions. 409 for the last active key.
     public func removeDevice(_ vaultId: String, _ deviceId: String) async throws {
         _ = try await raw("DELETE", "\(vaultPath(vaultId))/devices/\(enc(deviceId))")
@@ -233,6 +238,18 @@ public actor ApiClient {
         try await call("GET", "\(vaultPath(vaultId))/changes?since=\(since)&limit=\(limit)")
     }
 
+    // MARK: Locks (protocol.md 11)
+
+    /// Take or renew a soft lease lock. Throws `423 locked` with the holder in `details.lock`.
+    @discardableResult
+    public func acquireLock(_ vaultId: String, _ fileId: String, clientId: String, ttl: Int = 120) async throws -> Lock {
+        try await call("POST", "\(vaultPath(vaultId))/locks/\(enc(fileId))", json: AcquireRequest(clientId: clientId, ttl: ttl))
+    }
+
+    public func releaseLock(_ vaultId: String, _ fileId: String, clientId: String) async throws {
+        _ = try await raw("DELETE", "\(vaultPath(vaultId))/locks/\(enc(fileId))?clientId=\(enc(clientId))")
+    }
+
     /// Also returns when the keyring version passes `keyringSince`, if given.
     public func wait(_ vaultId: String, since: Int, locksSince: Int, timeout: Int = 25, keyringSince: Int? = nil) async throws -> WaitResponse {
         let keyring = keyringSince.map { "&keyringSince=\($0)" } ?? ""
@@ -285,6 +302,8 @@ public actor ApiClient {
         do {
             response = try await withTimeout(timeout) { [transport, timeout] in try await transport.send(req, timeout: timeout) }
         } catch {
+            // Cancelled by the caller (a sync that is stopped), not a server that can't be reached.
+            if Task.isCancelled { throw CancellationError() }
             throw ConnectionError("Can't reach the server.")
         }
         try checkServerVersion(response)
