@@ -51,7 +51,7 @@ Python 3.12, managed with uv. Package `syncryption_server` under `backend/src/`.
 | `encoding` | `b64u`, RFC 3339 times, id formats |
 | `sshkeys` | devices' encryption keys (Ed25519 public keys in OpenSSH format): parsing, fingerprints, pairing codes, sshsig verification |
 | `state` | per-app state: settings, database, blob store, clock, rate limiter, long-poll notifier, blob locks, the in-memory copy of the maintenance flag, metrics |
-| `metrics` | Prometheus collectors in a per-app registry, the request middleware (labels by route template), the `/metrics` rendering, which counts users, vaults, keys, files, revisions, blobs and locks in SQLite at each scrape, the container's memory and CPU read from its own cgroup v2 files, and, with S3, the bucket calls by operation and result, their duration, retries and bytes, plus Litestream's own metrics, read from its listener on `127.0.0.1:9091` (the entrypoint passes the address in `SYNCRYPTION_LITESTREAM_METRICS` while Litestream replicates) and passed on unchanged |
+| `metrics` | Prometheus collectors in a per-app registry, the request middleware (labels by route template), the `/metrics` rendering, which counts users, vaults, keys, files, revisions, blobs and locks in SQLite at each scrape, the container's memory and CPU read from its own cgroup v2 files, and, with S3, the bucket calls by operation and result, their duration, retries and bytes, plus Litestream's own metrics, read from its listener on `127.0.0.1:9091` (the entrypoint passes the address in `SYNCRYPTION_LITESTREAM_METRICS` while Litestream replicates) and passed on unchanged; also the request totals per device for the admin Activity tab, kept outside the registry (the device comes from authentication through the request scope) |
 | `auth` | challenges, sshsig verification, joining with `SHARED_SECRET`, session tokens (5 minutes for a remote-only device, so each login renews its lease), the grace period sent at login, refusing locked devices and keeping remote-only devices out of the vault's management calls |
 | `devices` | the vault's keys (devices): list, approval (with the remote-only flag), removal, policy changes, locking and unlocking remote-only devices, `/devices/self` |
 | `vaults` | open/create the key's vault by name, keyring versions, recovery |
@@ -60,7 +60,9 @@ Python 3.12, managed with uv. Package `syncryption_server` under `backend/src/`.
 | `retention` | hourly pruning of old revisions (protocol.md 9.3) |
 | `sync` | revision commits with the `parentRev` check, history, change feed, long-poll |
 | `locks` | lease locks and `locksSeq` |
-| `admin` | `/admin` page and `/admin/api` (token, session cookie and CSRF, user and vault listing, disable, enable, purge, maintenance mode, each vault's remote-only grace period and storage quota, the Performance tab with its snapshot JSON and `static/admin-performance.js`) |
+| `admin` | `/admin` page and `/admin/api` (token, session cookie and CSRF, user and vault listing, disable, enable, purge, maintenance mode, each vault's remote-only grace period and storage quota, the Performance tab with its snapshot JSON and `static/admin-performance.js`, the Activity tab with its totals per device and `static/admin-activity.js`, the Network tab with `static/admin-network.js`, the Billing tab) |
+| `billing` | the Billing tab's estimates: hourly samples of each vault's stored bytes and the server's own files into `storage_samples` (meta.db), the rates and their history, and per calendar month (UTC) the outbound transfer and GB-months per vault, user and server line |
+| `netmon` | network monitoring for the admin Network tab: an outermost ASGI middleware that counts each request's bytes (bodies, request and status lines, headers) by device or source, the S3 store's bytes per call attributed through a context variable to the request that made it (`server` outside requests), Litestream's replica bytes from its metrics; per-minute counters written every 15 s to `/data/netmon.db` (a separate SQLite file that Litestream doesn't replicate, with device, vault and user names copied in), an hourly outbound total per vault for billing, the queries behind the graphs, range and period totals, and pruning by age |
 | `migrate` | `MIGRATE_TO_S3` and `MIGRATE_FROM_S3` one-shot copies, run by the entrypoint before serving |
 | `__main__` | the entrypoint's commands: `check`, `check-data`, `render`, `migrate`, `health`, `openapi` (the schema `npm run api-types` reads) and `apidocs` (generates `docs/api.md`) |
 
@@ -184,6 +186,24 @@ erDiagram
         int since
         text message "shown to users, or null"
     }
+    storage_samples {
+        int hour PK "every hour, for billing"
+        text vault_id PK "empty for the server's own files"
+        text store "local or s3"
+        int bytes
+    }
+    billing_vaults {
+        text vault_id PK
+        text user_id
+        text username
+        text vault_name
+    }
+    billing_rates {
+        int since PK
+        real transfer_gb
+        real local_gb_month
+        real s3_gb_month
+    }
 ```
 - A device row is one key in one vault (`devices.vault_id`); its `status` is its access to
   the vault, so there is no separate membership table.
@@ -217,13 +237,14 @@ sequenceDiagram
 ```
 - Ids are text: UUIDv4 for users and vaults, `d_...` for devices. Times are integer Unix
   seconds.
-- The schema version is `PRAGMA user_version`, currently 8. An empty database is created
-  at the current version; a database at version 5 to 7 is migrated step by step, each step
+- The schema version is `PRAGMA user_version`, currently 11. An empty database is created
+  at the current version; a database at version 5 to 10 is migrated step by step, each step
   in its own transaction. Versions 1 to 4 come from servers before 0.1.4 (one key for every
   vault of a user) and aren't migrated: the server and the entrypoint's `check-data` refuse
   them with a message to delete the data.
 - `maintenance` and `admin_sessions` stand alone. The app reads `maintenance` at startup and
-  then keeps it in memory; only the admin routes change it (protocol.md 14.1).
+  then keeps it in memory; only the admin routes change it (protocol.md 14.1). The billing
+  tables (protocol.md 14.5) have no foreign keys, so a purged vault's history stays.
 - There is one `sqlite3` connection for writes, used only from one dedicated database
   thread: a handler runs its queries with `await db.run(fn)`. Each stretch of queries that
   must be consistent is one `fn`, and the thread runs them one at a time, so nothing
